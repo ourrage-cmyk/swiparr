@@ -131,6 +131,8 @@ const AUTO_ARCHIVE_ARCHIVE_BATCH_MIN = 1;
 const AUTO_ARCHIVE_ARCHIVE_BATCH_MAX = 100;
 const AUTO_ARCHIVE_CONFIDENCE_THRESHOLD = 0.2;
 const ARCHIVED_ALBUM_NAME = 'archived';
+const ARCHIVE_VISIBILITY = 'archive';
+const TIMELINE_VISIBILITY = 'timeline';
 
 async function ensureQdrantReady() {
     if (qdrantReady) {
@@ -328,7 +330,7 @@ async function archiveAssetBatch(immichBase, headers, assetIds) {
     const response = await fetch(`${immichBase}/api/assets`, {
         method: 'PUT',
         headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: assetIds, isArchived: true }),
+        body: JSON.stringify({ ids: assetIds, visibility: ARCHIVE_VISIBILITY }),
     });
 
     if (!response.ok) {
@@ -383,6 +385,12 @@ async function addAssetsToAlbum(immichBase, apiKey, albumId, assetIds) {
         const errorText = await response.text().catch(() => '');
         throw new Error(`Immich add-to-album failed (${response.status}): ${errorText}`);
     }
+
+    const results = await response.json().catch(() => []);
+    const failed = Array.isArray(results) ? results.filter((item) => !item.success) : [];
+    if (failed.length > 0) {
+        throw new Error(`Immich add-to-album failed for ${failed.length} assets.`);
+    }
 }
 
 async function archiveAssetsWithVerification({ immichBase, headers, apiKey, assetIds, chunkSize }) {
@@ -394,14 +402,14 @@ async function archiveAssetsWithVerification({ immichBase, headers, apiKey, asse
         for (const assetId of batchIds) {
             try {
                 const details = await fetchAssetDetails(immichBase, apiKey, assetId);
-                if (details.isArchived) {
+                if (details.isArchived || details.visibility === ARCHIVE_VISIBILITY) {
                     verifiedArchivedIds.push(assetId);
                     continue;
                 }
 
                 await archiveAssetBatch(immichBase, headers, [assetId]);
                 const retriedDetails = await fetchAssetDetails(immichBase, apiKey, assetId);
-                if (retriedDetails.isArchived) {
+                if (retriedDetails.isArchived || retriedDetails.visibility === ARCHIVE_VISIBILITY) {
                     verifiedArchivedIds.push(assetId);
                 } else {
                     console.warn(`[Cron] Asset ${assetId} did not verify as archived after retry.`);
@@ -478,11 +486,15 @@ app.get('/api/triage', async (req, res) => {
             console.warn('[Triage] Qdrant not ready, returning random unscored assets');
             const immichBase = immichUrl.endsWith('/') ? immichUrl.slice(0, -1) : immichUrl;
             const headers = { 'x-api-key': apiKey, 'Accept': 'application/json' };
-            const randResp = await fetch(`${immichBase}/api/assets/random?count=${batchSize}`, { headers });
+            const randResp = await fetch(`${immichBase}/api/search/random`, {
+                method: 'POST',
+                headers: { ...headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ size: batchSize, visibility: TIMELINE_VISIBILITY }),
+            });
             if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
             const assets = await randResp.json();
             const scoredAssets = assets
-                .filter(a => a.type === 'IMAGE')
+                .filter(a => a.type === 'IMAGE' && !a.isTrashed && a.visibility !== ARCHIVE_VISIBILITY)
                 .map((asset, idx) => ({
                     asset,
                     score: 0.5,
@@ -495,7 +507,11 @@ app.get('/api/triage', async (req, res) => {
         const headers = { 'x-api-key': apiKey, 'Accept': 'application/json' };
 
         // 1. Fetch a bounded random sample from Immich
-        const randResp = await fetch(`${immichBase}/api/assets/random?count=${batchSize}`, { headers });
+        const randResp = await fetch(`${immichBase}/api/search/random`, {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ size: batchSize, visibility: TIMELINE_VISIBILITY }),
+        });
         if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
         const assets = await randResp.json();
 
@@ -624,11 +640,15 @@ async function runAutoArchive(options = {}) {
         const scanBatchSize = Number(appSettings.autoArchiveScanBatchSize ?? AUTO_ARCHIVE_SCAN_BATCH_SIZE);
         const scanBatchesPerRun = Number(appSettings.autoArchiveScanBatchesPerRun ?? AUTO_ARCHIVE_BATCHES_PER_RUN);
         for (let batchIndex = 0; batchIndex < scanBatchesPerRun; batchIndex += 1) {
-            const randResp = await fetch(`${immichBase}/api/assets/random?count=${scanBatchSize}`, { headers });
+            const randResp = await fetch(`${immichBase}/api/search/random`, {
+                method: 'POST',
+                headers: { ...headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ size: scanBatchSize, visibility: TIMELINE_VISIBILITY }),
+            });
             if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
             const assets = await randResp.json();
             for (const asset of assets) {
-                if (asset.type === 'IMAGE' && !asset.isArchived) {
+                if (asset.type === 'IMAGE' && !asset.isTrashed && asset.visibility !== ARCHIVE_VISIBILITY && !asset.isArchived) {
                     candidateMap.set(asset.id, asset);
                 }
             }

@@ -25,6 +25,8 @@ export function useImmich() {
   const CHRONO_PAGE_SIZE = 50
   const RANDOM_BATCH_SIZE = 5
   const RANDOM_MAX_ATTEMPTS = 20
+  const ARCHIVE_VISIBILITY = 'archive'
+  const TIMELINE_VISIBILITY = 'timeline'
 
   const albumsCache = ref<ImmichAlbum[] | null>(null)
   const ARCHIVED_ALBUM_NAME = 'archived'
@@ -44,8 +46,13 @@ export function useImmich() {
 
   const actionHistory = ref<ReviewAction[]>([])
 
+  function isArchivedAsset(asset: ImmichAsset): boolean {
+    return asset.isArchived || asset.visibility === ARCHIVE_VISIBILITY || asset.isTrashed
+  }
+
   function isReviewable(asset: ImmichAsset): boolean {
     if (reviewedStore.isReviewed(asset.id)) return false
+    if (isArchivedAsset(asset)) return false
     if (uiStore.skipVideos && asset.type === 'VIDEO') return false
     return true
   }
@@ -168,7 +175,13 @@ export function useImmich() {
       const attempts = uiStore.skipVideos ? SKIP_VIDEOS_MAX_ATTEMPTS : RANDOM_MAX_ATTEMPTS
       for (let attempt = 0; attempt < attempts; attempt++) {
         const count = uiStore.skipVideos ? SKIP_VIDEOS_BATCH_SIZE : RANDOM_BATCH_SIZE
-        const assets = await apiRequest<ImmichAsset[]>(`/assets/random?count=${count}`)
+        const assets = await apiRequest<ImmichAsset[]>('/search/random', {
+          method: 'POST',
+          body: JSON.stringify({
+            size: count,
+            visibility: TIMELINE_VISIBILITY,
+          }),
+        })
         if (!assets || assets.length === 0) {
           continue
         }
@@ -192,6 +205,7 @@ export function useImmich() {
     const usePagePagination = chronologicalPagingMode.value !== 'skip'
     const body: MetadataSearchRequest = {
       order,
+      visibility: TIMELINE_VISIBILITY,
       assetType: ['IMAGE', 'VIDEO'],
     }
     if (usePagePagination && chronologicalPage.value !== null) {
@@ -217,6 +231,7 @@ export function useImmich() {
       chronologicalPage.value = null
       const fallbackBody: MetadataSearchRequest = {
         order,
+        visibility: TIMELINE_VISIBILITY,
         assetType: ['IMAGE', 'VIDEO'],
         take: CHRONO_PAGE_SIZE,
         skip: chronologicalSkip.value,
@@ -458,6 +473,10 @@ export function useImmich() {
     await addAssetToAlbum(album.id, assetId)
   }
 
+  async function fetchAssetDetails(assetId: string): Promise<ImmichAsset> {
+    return apiRequest<ImmichAsset>(`/assets/${assetId}`)
+  }
+
   async function fetchAlbumAssets(albumId: string): Promise<ImmichAsset[]> {
     const album = await apiRequest<Record<string, unknown>>(`/albums/${albumId}`)
     const rawAssets = Array.isArray(album.assets)
@@ -477,16 +496,21 @@ export function useImmich() {
     }
 
     const assets = await fetchAlbumAssets(archivedAlbum.id)
-    return assets.filter((asset) => asset.isArchived)
+    return assets.filter((asset) => isArchivedAsset(asset))
   }
 
   async function addAssetToAlbum(albumId: string, assetId: string): Promise<void> {
-    await apiRequest(`/albums/${albumId}/assets`, {
+    const result = await apiRequest<Array<{ id: string; success: boolean; error?: string; errorMessage?: string }>>(`/albums/${albumId}/assets`, {
       method: 'PUT',
       body: JSON.stringify({
         ids: [assetId],
       }),
     })
+
+    const status = Array.isArray(result) ? result.find((item) => item.id === assetId) : null
+    if (!status || !status.success) {
+      throw new Error(status?.errorMessage || status?.error || 'Album add failed')
+    }
   }
 
   // Removed deleteAsset and restoreAsset as they were replaced by archivePhoto/archiveAsset logic.
@@ -494,15 +518,16 @@ export function useImmich() {
   // Archive asset
   async function archiveAsset(assetId: string, isArchived: boolean = true): Promise<boolean> {
     try {
-      // Robust API call for archiving
       await apiRequest(`/assets`, {
         method: 'PUT',
         body: JSON.stringify({ 
           ids: [assetId],
-          isArchived 
+          visibility: isArchived ? ARCHIVE_VISIBILITY : TIMELINE_VISIBILITY,
         }),
       })
-      return true
+
+      const updatedAsset = await fetchAssetDetails(assetId)
+      return isArchived ? isArchivedAsset(updatedAsset) : !isArchivedAsset(updatedAsset)
     } catch (e) {
       console.error('Failed to update archive status:', e)
       error.value = e instanceof Error ? e.message : 'Failed to archive photo'

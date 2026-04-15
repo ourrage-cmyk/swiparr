@@ -12,6 +12,7 @@ export interface ImmichAsset {
   fileModifiedAt: string
   localDateTime: string
   updatedAt: string
+  visibility?: 'archive' | 'timeline' | 'hidden' | 'locked'
   isFavorite: boolean
   isArchived: boolean
   isTrashed: boolean
@@ -73,6 +74,7 @@ export interface MetadataSearchRequest {
   page?: number
   size?: number
   order?: 'asc' | 'desc'
+  visibility?: 'archive' | 'timeline' | 'hidden' | 'locked'
   assetType?: ('IMAGE' | 'VIDEO')[]
 }
 
