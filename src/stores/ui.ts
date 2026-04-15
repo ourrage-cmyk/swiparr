@@ -4,16 +4,17 @@ import { useAuthStore } from '@/stores/auth'
 
 export const useUiStore = defineStore('ui', () => {
   const authStore = useAuthStore()
-  // Dark mode state - persisted to localStorage
+
+  // Theme state
   const isDarkMode = ref<boolean>(true)
   const skipVideos = ref<boolean>(false)
+  const autoArchiveEnabled = ref<boolean>(false)
 
   // Initialize from localStorage
   const storedTheme = localStorage.getItem('immich-swipe-theme')
   if (storedTheme !== null) {
     isDarkMode.value = storedTheme === 'dark'
   } else {
-    // Default to system preference
     isDarkMode.value = window.matchMedia('(prefers-color-scheme: dark)').matches
   }
 
@@ -23,11 +24,11 @@ export const useUiStore = defineStore('ui', () => {
   }
 
   // Watch and persist changes
-  watch(isDarkMode, (newValue) => {
+  watch(isDarkMode, (newValue: boolean) => {
     localStorage.setItem('immich-swipe-theme', newValue ? 'dark' : 'light')
   })
 
-  watch(skipVideos, (newValue) => {
+  watch(skipVideos, (newValue: boolean) => {
     localStorage.setItem('immich-swipe-skip-videos', newValue ? 'true' : 'false')
   })
 
@@ -154,5 +155,6 @@ export const useUiStore = defineStore('ui', () => {
     resetStats,
     skipVideos,
     toggleSkipVideos,
+    autoArchiveEnabled,
   }
 })

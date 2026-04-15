@@ -78,9 +78,13 @@ export function useImmich() {
     }
 
     const normalizedEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`
-    const url = `${authStore.immichBaseUrl}${authStore.proxyBaseUrl}${normalizedEndpoint}`
+    
+    // REDIRECT: Use the local Node server as a proxy to avoid CORS and Mixed Content issues.
+    const url = `${window.location.origin}/api/immich-proxy${normalizedEndpoint}`
+    
     const headers: HeadersInit = {
       'x-api-key': authStore.apiKey,
+      'x-target-host': authStore.immichBaseUrl,
       'Accept': 'application/json',
       ...options.headers,
     }
@@ -104,6 +108,7 @@ export function useImmich() {
       } catch {
         errorMessage = `API error: ${response.status} - ${errorText}`
       }
+      console.error(`[Immich API Request Failed] Endpoint: ${endpoint} | Status: ${response.status} | Err:`, errorMessage)
       throw new Error(errorMessage)
     }
 
@@ -117,10 +122,39 @@ export function useImmich() {
   async function testConnection(): Promise<boolean> {
     try {
       uiStore.setLoading(true, 'Testing connection...')
-      await apiRequest('/users/me')
+      error.value = null
+      
+      console.log('[Auth] Testing Node backend reachability...');
+      const pingResp = await fetch(`${window.location.origin}/api/ping`, {
+          headers: { 'x-target-host': authStore.immichBaseUrl }
+      }).catch(() => null);
+      
+      if (!pingResp || !pingResp.ok) {
+          throw new Error('NETWORK_ERROR: Browser cannot reach Swiparr backend. Check your firewall/ports.');
+      }
+      
+      const diag = await pingResp.json();
+      if (diag.immich.includes('Failed')) {
+          throw new Error(`ROUTING_ERROR: Swiparr Container cannot reach Immich IP: ${diag.immich}`);
+      }
+      
+      console.log('[Auth] Diagnostics OK. Testing Immich API...');
+      const resp = await fetch(`${window.location.origin}/api/immich-proxy/users/me`, {
+          headers: { 
+              'x-api-key': authStore.apiKey,
+              'x-target-host': authStore.immichBaseUrl
+          }
+      });
+      
+      if (!resp.ok) {
+          const body = await resp.json().catch(() => ({}));
+          throw new Error(`API_ERROR: ${resp.status} - ${body.error || body.message || 'Unknown backend error'}`);
+      }
       return true
     } catch (e) {
-      error.value = e instanceof Error ? e.message : 'Connection failed'
+      const msg = e instanceof Error ? e.message : 'Connection failed'
+      error.value = msg
+      console.error('[Auth] Test failed:', msg);
       return false
     } finally {
       uiStore.setLoading(false)
@@ -365,17 +399,15 @@ export function useImmich() {
 
   // Get asset thumbnail URL
   function getAssetThumbnailUrl(assetId: string, size: 'thumbnail' | 'preview' = 'preview'): string {
-    if (!authStore.immichBaseUrl) {
-      return ''
-    }
-    return `${authStore.immichBaseUrl}${authStore.proxyBaseUrl}/assets/${assetId}/thumbnail?size=${size}`
+    const params = `?size=${size}&key=${authStore.apiKey}&host=${encodeURIComponent(authStore.immichBaseUrl)}`;
+    const url = `${window.location.origin}/api/immich-proxy/assets/${assetId}/thumbnail${params}`;
+    console.log('[Media] Thumbnail URL:', url);
+    return url
   }
 
   function getAssetOriginalUrl(assetId: string): string {
-    if (!authStore.immichBaseUrl) {
-      return ''
-    }
-    return `${authStore.immichBaseUrl}${authStore.proxyBaseUrl}/assets/${assetId}/original`
+    const params = `?key=${authStore.apiKey}&host=${encodeURIComponent(authStore.immichBaseUrl)}`;
+    return `${window.location.origin}/api/immich-proxy/assets/${assetId}/original${params}`
   }
 
   // Get headers for image requests
@@ -422,38 +454,39 @@ export function useImmich() {
     })
   }
 
-  // Delete asset (move to trash)
-  async function deleteAsset(assetId: string, force: boolean = false): Promise<boolean> {
+  // Removed deleteAsset and restoreAsset as they were replaced by archivePhoto/archiveAsset logic.
+
+  // Archive asset
+  async function archiveAsset(assetId: string, isArchived: boolean = true): Promise<boolean> {
     try {
-      await apiRequest('/assets', {
-        method: 'DELETE',
-        body: JSON.stringify({
+      // Robust API call for archiving
+      await apiRequest(`/assets`, {
+        method: 'PATCH',
+        body: JSON.stringify({ 
           ids: [assetId],
-          force,
+          isArchived 
         }),
       })
       return true
     } catch (e) {
-      console.error('Failed to delete asset:', e)
-      error.value = e instanceof Error ? e.message : 'Failed to delete photo'
+      console.error('Failed to update archive status:', e)
+      error.value = e instanceof Error ? e.message : 'Failed to archive photo'
       return false
     }
   }
 
-  // Restore asset from trash
-  async function restoreAsset(assetId: string): Promise<boolean> {
+  // Create album
+  async function createAlbum(albumName: string): Promise<ImmichAlbum> {
     try {
-      await apiRequest('/trash/restore/assets', {
+      const album = await apiRequest<ImmichAlbum>('/albums', {
         method: 'POST',
-        body: JSON.stringify({
-          ids: [assetId],
-        }),
+        body: JSON.stringify({ albumName }),
       })
-      return true
+      albumsCache.value = null // Invalidate cache
+      return album
     } catch (e) {
-      console.error('Failed to restore asset:', e)
-      error.value = e instanceof Error ? e.message : 'Failed to restore photo'
-      return false
+      console.error('Failed to create album:', e)
+      throw e
     }
   }
 
@@ -521,21 +554,21 @@ export function useImmich() {
     }
   }
 
-  // Delete
-  async function deletePhoto(): Promise<void> {
+  // Archive (Left Swipe)
+  async function archivePhoto(): Promise<void> {
     if (!currentAsset.value) return
 
-    const assetToDelete = currentAsset.value
-    const success = await deleteAsset(assetToDelete.id)
+    const assetToArchive = currentAsset.value
+    const success = await archiveAsset(assetToArchive.id, true)
 
     if (success) {
-      actionHistory.value.push({ asset: assetToDelete, type: 'delete' })
-      reviewedStore.markReviewed(assetToDelete.id, 'delete')
+      actionHistory.value.push({ asset: assetToArchive, type: 'delete' }) // Keep 'delete' type for internal history/stats simplicity
+      reviewedStore.markReviewed(assetToArchive.id, 'delete')
       uiStore.incrementDeleted()
-      uiStore.toast('Photo deleted', 'info', 1500)
+      uiStore.toast('Photo archived', 'info', 1500)
       moveToNextAsset()
     } else {
-      uiStore.toast('Failed to delete photo', 'error')
+      uiStore.toast('Failed to archive photo', 'error')
     }
   }
 
@@ -551,16 +584,17 @@ export function useImmich() {
     const preloadedAfterResume = nextAsset.value
 
     if (lastAction.type === 'delete') {
-      const success = await restoreAsset(lastAction.asset.id)
+      // Undo archive by setting isArchived to false
+      const success = await archiveAsset(lastAction.asset.id, false)
       if (!success) {
         actionHistory.value.push(lastAction)
-        uiStore.toast('Failed to restore photo', 'error')
+        uiStore.toast('Failed to undo archive', 'error')
         return
       }
 
       reviewedStore.unmarkReviewed(lastAction.asset.id)
       uiStore.decrementDeleted()
-      uiStore.toast(`${lastAction.asset.originalFileName} was restored`, 'success', 2500)
+      uiStore.toast(`${lastAction.asset.originalFileName} was un-archived`, 'success', 2500)
       if (preloadedAfterResume?.id !== assetToResumeAfterUndo?.id) {
         enqueuePendingAsset(preloadedAfterResume)
       }
@@ -592,13 +626,15 @@ export function useImmich() {
     keepPhoto,
     keepPhotoToAlbum,
     toggleFavorite,
-    deletePhoto,
+    archivePhoto,
     undoLastAction,
     canUndo,
     getAssetThumbnailUrl,
     getAssetOriginalUrl,
     getAuthHeaders,
     fetchAlbums,
+    createAlbum,
     addAssetToAlbum,
+    archiveAsset,
   }
 }

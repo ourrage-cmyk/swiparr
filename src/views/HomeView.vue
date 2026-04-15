@@ -3,6 +3,8 @@ import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useImmich } from '@/composables/useImmich'
 import { useUiStore } from '@/stores/ui'
 import { usePreferencesStore } from '@/stores/preferences'
+import { useAiStore } from '@/stores/aiStore'
+import { useRouter } from 'vue-router'
 import type { ImmichAlbum } from '@/types/immich'
 import AppHeader from '@/components/AppHeader.vue'
 import SwipeCard from '@/components/SwipeCard.vue'
@@ -16,18 +18,44 @@ const {
   keepPhoto,
   keepPhotoToAlbum,
   toggleFavorite,
-  deletePhoto,
+  archivePhoto,
   undoLastAction,
   fetchAlbums,
   canUndo,
 } = useImmich()
+const router = useRouter()
 const uiStore = useUiStore()
 const preferencesStore = usePreferencesStore()
+const aiStore = useAiStore()
 
 const showAlbumPicker = ref(false)
 const isLoadingAlbums = ref(false)
 const albumsError = ref<string | null>(null)
 const albums = ref<ImmichAlbum[]>([])
+
+const autoArchiveEnabled = ref(false)
+
+async function toggleAutoArchive() {
+    try {
+        await fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ autoArchive: autoArchiveEnabled.value })
+        });
+    } catch(e) {
+        console.error('Failed to save settings', e);
+    }
+}
+
+onMounted(async () => {
+    try {
+        const resp = await fetch('/api/settings');
+        if (resp.ok) {
+            const settings = await resp.json();
+            autoArchiveEnabled.value = settings.autoArchive;
+        }
+    } catch(e) {}
+})
 
 // Keyboard navigation
 function handleKeydown(e: KeyboardEvent) {
@@ -49,7 +77,7 @@ function handleKeydown(e: KeyboardEvent) {
     keepPhoto()
   } else if (e.key === 'ArrowLeft') {
     e.preventDefault()
-    deletePhoto()
+    archivePhoto()
   } else if (e.key.toLowerCase() === 'f') {
     if (shouldIgnoreHotkeys()) return
     e.preventDefault()
@@ -166,8 +194,8 @@ onUnmounted(() => {
           <div v-if="currentAsset" class="w-full h-full max-w-4xl max-h-full">
             <SwipeCard
               :asset="currentAsset"
-              @keep="keepPhoto"
-              @delete="deletePhoto"
+              @keep="(img) => { keepPhoto(); aiStore.trainOnAsset(img, true); }"
+              @delete="(img) => { archivePhoto(); aiStore.trainOnAsset(img, false); }"
             />
           </div>
 
@@ -189,12 +217,22 @@ onUnmounted(() => {
             :can-undo="canUndo"
             :is-favorite="currentAsset?.isFavorite ?? false"
             @keep="keepPhoto"
-            @delete="deletePhoto"
+            @delete="archivePhoto"
             @undo="undoLastAction"
             @toggle-favorite="toggleFavorite"
             @open-album-picker="openAlbumPicker"
             @album-drop="openAlbumPicker"
           />
+          <button 
+              @click="router.push('/triage')"
+              class="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+          >
+              Automatic Cleanup
+          </button>
+          <div class="mt-4 flex items-center gap-2">
+              <input type="checkbox" v-model="autoArchiveEnabled" @change="toggleAutoArchive" id="autoArchive" class="w-4 h-4" />
+              <label for="autoArchive" class="text-sm">Enable Server-Side Auto-Archive (Cron)</label>
+          </div>
 
           <!-- Instructions (now mobile -> hidden) -->
           <div class="hidden sm:flex text-center text-sm py-2 items-center flex-col gap-y-2"

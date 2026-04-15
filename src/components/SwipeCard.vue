@@ -10,8 +10,8 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  keep: []
-  delete: []
+  keep: [image: HTMLImageElement | null]
+  delete: [image: HTMLImageElement | null]
 }>()
 
 const uiStore = useUiStore()
@@ -20,6 +20,7 @@ const authStore = useAuthStore()
 const cardRef = ref<HTMLElement | null>(null)
 const imageLoaded = ref(false)
 const imageError = ref(false)
+const imageRef = ref<HTMLImageElement | null>(null)
 const imageBlobUrl = ref<string | null>(null)
 const videoBlobUrl = ref<string | null>(null)
 const videoError = ref(false)
@@ -47,8 +48,8 @@ const canOpenInImmich = computed(() => assetPageUrl.value.length > 0)
 // composable
 const { isSwiping, swipeOffset, swipeDirection } = useSwipe(cardRef, {
   threshold: 100,
-  onSwipeRight: () => emit('keep'),
-  onSwipeLeft: () => emit('delete'),
+  onSwipeRight: () => emit('keep', imageRef.value),
+  onSwipeLeft: () => emit('delete', imageRef.value),
 })
 
 // transform based on swipe
@@ -313,11 +314,13 @@ const formattedDate = computed(() => {
 
       <!-- Actual image -->
       <img
+        ref="imageRef"
         v-if="!isVideo && imageBlobUrl"
         :src="imageBlobUrl"
         :alt="asset.originalFileName"
         class="w-full h-full object-contain"
         draggable="false"
+        crossorigin="anonymous"
       />
 
       <!-- Actual video -->

@@ -190,6 +190,18 @@ function confirmResetReviewed() {
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8h4M4 12h7M4 16h10M18 6v12m0 0-3-3m3 3 3-3" />
         </svg>
       </button>
+
+      <!-- Triage Mode button -->
+      <button
+        @click="router.push('/triage')"
+        class="flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium border bg-blue-600 border-blue-500 text-white transition-colors hover:bg-blue-700"
+      >
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+        </svg>
+        <span class="hidden sm:inline">Bulk Triage</span>
+      </button>
+
       <!-- Logout / Switch User -->
       <button
         @click="logout"

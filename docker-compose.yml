@@ -20,8 +20,11 @@ services:
         - VITE_USER_4_API_KEY=${VITE_USER_4_API_KEY:-}
         - VITE_USER_5_NAME=${VITE_USER_5_NAME:-}
         - VITE_USER_5_API_KEY=${VITE_USER_5_API_KEY:-}
+    image: goethenorris/swiparr:latest
     container_name: immich-swipe
     restart: unless-stopped
     ports:
-      - "2293:80"
-
+      - "8080:80"
+    environment:
+      - QDRANT_HOST=qdrant
+    privileged: false
