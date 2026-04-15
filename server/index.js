@@ -532,6 +532,48 @@ app.get('/api/triage', async (req, res) => {
     }
 });
 
+app.post('/api/triage/apply', async (req, res) => {
+    try {
+        const { immichUrl, apiKey, assetIds } = req.body || {};
+        if (!immichUrl || !apiKey) {
+            return res.status(400).json({ error: 'Missing immichUrl or apiKey' });
+        }
+        if (!Array.isArray(assetIds)) {
+            return res.status(400).json({ error: 'assetIds must be an array' });
+        }
+
+        const normalizedAssetIds = [...new Set(assetIds.filter((id) => typeof id === 'string' && id.length > 0))];
+        if (normalizedAssetIds.length === 0) {
+            return res.json({ success: true, archivedCount: 0, archivedIds: [] });
+        }
+
+        const immichBase = immichUrl.endsWith('/') ? immichUrl.slice(0, -1) : immichUrl;
+        const headers = { 'x-api-key': apiKey, 'Accept': 'application/json' };
+        const verifiedArchivedIds = await archiveAssetsWithVerification({
+            immichBase,
+            headers,
+            apiKey,
+            assetIds: normalizedAssetIds,
+            chunkSize: Math.min(normalizedAssetIds.length, AUTO_ARCHIVE_ARCHIVE_BATCH_MAX),
+        });
+
+        if (verifiedArchivedIds.length > 0) {
+            const archivedAlbum = await ensureArchivedAlbum(immichBase, apiKey);
+            await addAssetsToAlbum(immichBase, apiKey, archivedAlbum.id, verifiedArchivedIds);
+        }
+
+        res.json({
+            success: true,
+            archivedCount: verifiedArchivedIds.length,
+            archivedIds: verifiedArchivedIds,
+            requestedCount: normalizedAssetIds.length,
+        });
+    } catch (e) {
+        console.error('[Triage Apply] Error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 /**
  * GET /api/stats
  * Returns count of good/bad points in the collection.

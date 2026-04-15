@@ -40,10 +40,17 @@ async function loadTriage() {
 
 async function submitTriage() {
     loading.value = true;
-    await aiStore.trainOnBatch(items.value);
-    uiStore.toast('Batch successfully submitted to Qdrant!', 'success', 2000);
+    try {
+        await aiStore.trainOnBatch(items.value);
+        const result = await aiStore.applyTriageBatch(items.value);
+        const archivedCount = Number(result?.archivedCount ?? 0);
+        uiStore.toast(`Batch submitted. Archived ${archivedCount} items.`, 'success', 2200);
+    } catch (e) {
+        console.error('Failed to submit triage batch:', e);
+        uiStore.toast('Failed to apply triage batch.', 'error');
+    }
     // Reload a new batch
-    loadTriage();
+    await loadTriage();
 }
 
 onMounted(() => {

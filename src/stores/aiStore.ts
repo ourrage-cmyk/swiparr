@@ -59,6 +59,29 @@ export const useAiStore = defineStore('aiStore', () => {
         }
     }
 
+    async function applyTriageBatch(items: { asset: { id: string }; selected: boolean }[]) {
+        const { immichUrl, apiKey } = getImmichCredentials();
+        if (!immichUrl || !apiKey) {
+            return { archivedCount: 0, archivedIds: [] };
+        }
+
+        const assetIds = items
+            .filter((item) => item.selected)
+            .map((item) => item.asset.id);
+
+        const resp = await fetch(getBackendUrl() + '/api/triage/apply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ immichUrl, apiKey, assetIds }),
+        });
+
+        if (!resp.ok) {
+            throw new Error('Failed to apply triage archive batch.');
+        }
+
+        return await resp.json();
+    }
+
     /**
      * Fetch 250 scored assets from the backend triage endpoint.
      */
@@ -105,5 +128,5 @@ export const useAiStore = defineStore('aiStore', () => {
         return await resp.json();
     }
 
-    return { trainOnAsset, trainOnBatch, fetchTriageBatch, fetchStats, fetchSettings, saveSettings, runAutoArchive };
+    return { trainOnAsset, trainOnBatch, applyTriageBatch, fetchTriageBatch, fetchStats, fetchSettings, saveSettings, runAutoArchive };
 });
