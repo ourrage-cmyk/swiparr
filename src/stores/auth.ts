@@ -47,7 +47,7 @@ export const useAuthStore = defineStore('auth', () => {
   const apiKey = ref<string>('')
   const currentUserName = ref<string>('')
   const hasStoredConfig = ref<boolean>(false)
-  const proxyBaseUrl = '/api'
+  const proxyBaseUrl = '/api/immich-proxy'
 
   // .env state
   const hasEnvConfig = computed(() => envConfig !== null && envConfig.users.length > 0)

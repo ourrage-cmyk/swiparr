@@ -461,7 +461,7 @@ export function useImmich() {
     try {
       // Robust API call for archiving
       await apiRequest(`/assets`, {
-        method: 'PATCH',
+        method: 'PUT',
         body: JSON.stringify({ 
           ids: [assetId],
           isArchived 
