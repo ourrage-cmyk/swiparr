@@ -60,9 +60,24 @@ cp env.example .env
 docker compose up --build
 ```
 
-Open `http://localhost:2293`.
+Open `http://localhost:8080`.
 
 Note: `.env` values are passed as build args and end up in the frontend bundle. Changing `.env` requires a rebuild.
+
+### Docker image only
+
+If you want to use the published image without rebuilding locally:
+
+```bash
+cp env.example .env
+docker compose -f docker-compose.template.yml up -d
+```
+
+Open `http://localhost:8080`.
+
+Behavior:
+- Login is done manually in the web UI unless you build your own image with `VITE_*` values.
+- Server-side auto-archive can still run from the published image when `AUTO_ARCHIVE_IMMICH_URL` and `AUTO_ARCHIVE_API_KEY` are set in `.env`.
 
 ### GitHub Pages
 
@@ -100,6 +115,8 @@ Behavior:
 Note: user slots are currently wired up to `VITE_USER_5_*` in `src/vite-env.d.ts`, `Dockerfile`, and `docker-compose.yml`.
 
 Security note: `VITE_*` variables are embedded into the compiled frontend. Only use `VITE_USER_*_API_KEY` for private deployments/images.
+
+For the published Docker image, prefer `AUTO_ARCHIVE_IMMICH_URL` and `AUTO_ARCHIVE_API_KEY` for backend-only automation. These are read at runtime by the Node server and are not needed for manual UI login.
 
 ### Option B: manual login (runtime)
 

@@ -21,16 +21,12 @@ const cardRef = ref<HTMLElement | null>(null)
 const imageLoaded = ref(false)
 const imageError = ref(false)
 const imageRef = ref<HTMLImageElement | null>(null)
-const imageBlobUrl = ref<string | null>(null)
 const videoBlobUrl = ref<string | null>(null)
 const videoError = ref(false)
 const videoLoading = ref(false)
 const videoRef = ref<HTMLVideoElement | null>(null)
 const videoAbortController = ref<AbortController | null>(null)
 let autoplayCleanup: (() => void) | null = null
-const assetApiBaseUrl = computed(() => {
-  return authStore.proxyBaseUrl
-})
 const assetPageUrl = computed(() => {
   if (!authStore.immichBaseUrl) return ''
   try {
@@ -83,6 +79,15 @@ const deleteIndicatorOpacity = computed(() => {
 })
 
 const isVideo = computed(() => props.asset.type === 'VIDEO')
+const imageUrl = computed(() => {
+  if (!authStore.proxyBaseUrl || !authStore.apiKey || !authStore.immichBaseUrl) return ''
+  const params = new URLSearchParams({
+    size: 'preview',
+    key: authStore.apiKey,
+    host: authStore.immichBaseUrl,
+  })
+  return `${authStore.proxyBaseUrl}/assets/${props.asset.id}/thumbnail?${params.toString()}`
+})
 
 function cleanupAutoplay() {
   if (autoplayCleanup) {
@@ -98,11 +103,11 @@ function configureInlinePlayback(video: HTMLVideoElement) {
 }
 
 function buildAssetApiUrl(path: string): string {
-  if (!assetApiBaseUrl.value) {
+  if (!authStore.proxyBaseUrl) {
     throw new Error('Immich server URL missing')
   }
   const normalizedPath = path.startsWith('/') ? path.slice(1) : path
-  return `${assetApiBaseUrl.value}/assets/${props.asset.id}/${normalizedPath}`
+  return `${authStore.proxyBaseUrl}/assets/${props.asset.id}/${normalizedPath}`
 }
 
 function getAuthHeaders(): Record<string, string> {
@@ -126,34 +131,19 @@ function openInImmich() {
   }
 }
 
-// Fetch image with auth headers
-async function fetchImage() {
+function handleImageLoad() {
+  imageLoaded.value = true
+  imageError.value = false
+}
+
+function handleImageError() {
+  imageLoaded.value = false
+  imageError.value = true
+}
+
+function resetImageState() {
   imageLoaded.value = false
   imageError.value = false
-
-  // Revoke old blob URL
-  if (imageBlobUrl.value) {
-    URL.revokeObjectURL(imageBlobUrl.value)
-    imageBlobUrl.value = null
-  }
-
-  try {
-    const url = buildAssetApiUrl('thumbnail?size=preview')
-    const response = await fetch(url, {
-      headers: getAuthHeaders(),
-    })
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-
-    const blob = await response.blob()
-    imageBlobUrl.value = URL.createObjectURL(blob)
-    imageLoaded.value = true
-  } catch (e) {
-    console.error('Failed to load image:', e)
-    imageError.value = true
-  }
 }
 
 function cleanupVideo() {
@@ -210,10 +200,7 @@ async function fetchVideo() {
 }
 
 function cleanupAllMedia() {
-  if (imageBlobUrl.value) {
-    URL.revokeObjectURL(imageBlobUrl.value)
-    imageBlobUrl.value = null
-  }
+  resetImageState()
   cleanupVideo()
 }
 
@@ -222,8 +209,6 @@ watch(() => props.asset.id, () => {
   cleanupAllMedia()
   if (isVideo.value) {
     fetchVideo()
-  } else {
-    fetchImage()
   }
 }, { immediate: true })
 
@@ -314,12 +299,15 @@ const formattedDate = computed(() => {
       <!-- Actual image -->
       <img
         ref="imageRef"
-        v-if="!isVideo && imageBlobUrl"
-        :src="imageBlobUrl"
+        v-if="!isVideo && imageUrl"
+        :src="imageUrl"
         :alt="asset.originalFileName"
         class="w-full h-full object-contain"
         draggable="false"
-        crossorigin="anonymous"
+        decoding="async"
+        fetchpriority="high"
+        @load="handleImageLoad"
+        @error="handleImageError"
       />
 
       <!-- Actual video -->

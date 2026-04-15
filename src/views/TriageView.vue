@@ -2,17 +2,34 @@
 import { ref, onMounted } from 'vue'
 import { useAiStore } from '@/stores/aiStore'
 import { useUiStore } from '@/stores/ui'
+import { useAuthStore } from '@/stores/auth'
 import AppHeader from '@/components/AppHeader.vue'
 
 const aiStore = useAiStore()
 const uiStore = useUiStore()
+const authStore = useAuthStore()
 
 const loading = ref(true)
 const items = ref<any[]>([])
+const stats = ref({ total: 0, good: 0, bad: 0 })
+
+function getThumbnailUrl(assetId: string) {
+    const params = new URLSearchParams({
+        size: 'thumbnail',
+        key: authStore.apiKey,
+        host: authStore.immichBaseUrl,
+    })
+    return `${window.location.origin}${authStore.proxyBaseUrl}/assets/${assetId}/thumbnail?${params.toString()}`
+}
 
 async function loadTriage() {
     loading.value = true;
-    items.value = await aiStore.fetchTriageBatch();
+    const [batch, trainingStats] = await Promise.all([
+        aiStore.fetchTriageBatch(),
+        aiStore.fetchStats(),
+    ]);
+    items.value = batch;
+    stats.value = trainingStats;
     // By default, mark items as "delete" (checked) if score is < 0.3
     items.value.forEach(i => i.selected = (i.score < 0.3));
     loading.value = false;
@@ -36,6 +53,7 @@ onMounted(() => {
     <main class="flex-1 overflow-y-auto px-4 py-6">
         <h1 class="text-2xl font-bold mb-4">Triage Grid</h1>
         <p class="mb-4 text-sm text-gray-500">Uncheck photos you want to KEEP. Photos that remain checked will be marked as bad.</p>
+        <p class="mb-4 text-sm text-gray-500">Training set: {{ stats.total }} vectors, {{ stats.good }} keep, {{ stats.bad }} archive.</p>
         
         <div v-if="loading" class="flex flex-col items-center justify-center p-12">
             <div class="w-full max-w-md bg-gray-200 rounded-full h-2.5 mb-4 dark:bg-gray-700 overflow-hidden">
@@ -50,7 +68,7 @@ onMounted(() => {
                      class="relative aspect-square cursor-pointer overflow-hidden rounded-lg border-2 transition-colors"
                      :class="item.selected ? 'border-red-500' : 'border-transparent'"
                      @click="item.selected = !item.selected">
-                    <img :src="item.imgUrl" class="w-full h-full object-cover" />
+                    <img :src="getThumbnailUrl(item.asset.id)" class="w-full h-full object-cover" loading="lazy" />
                     <div class="absolute top-2 right-2 bg-black/50 rounded-full p-1 border">
                         <input type="checkbox" v-model="item.selected" @click.stop class="w-4 h-4" />
                     </div>

@@ -35,6 +35,21 @@ const albums = ref<ImmichAlbum[]>([])
 
 const autoArchiveEnabled = ref(false)
 
+function queueTrainingDecision(isGood: boolean) {
+  const assetId = currentAsset.value?.id ?? null
+  void aiStore.trainOnAsset(assetId, isGood)
+}
+
+async function handleKeep() {
+  queueTrainingDecision(true)
+  await keepPhoto()
+}
+
+async function handleArchive() {
+  queueTrainingDecision(false)
+  await archivePhoto()
+}
+
 async function toggleAutoArchive() {
     try {
         await fetch('/api/settings', {
@@ -74,10 +89,10 @@ function handleKeydown(e: KeyboardEvent) {
 
   if (e.key === 'ArrowRight') {
     e.preventDefault()
-    keepPhoto()
+    void handleKeep()
   } else if (e.key === 'ArrowLeft') {
     e.preventDefault()
-    archivePhoto()
+    void handleArchive()
   } else if (e.key.toLowerCase() === 'f') {
     if (shouldIgnoreHotkeys()) return
     e.preventDefault()
@@ -194,8 +209,8 @@ onUnmounted(() => {
           <div v-if="currentAsset" class="w-full h-full max-w-4xl max-h-full">
             <SwipeCard
               :asset="currentAsset"
-              @keep="(img) => { keepPhoto(); aiStore.trainOnAsset(img, true); }"
-              @delete="(img) => { archivePhoto(); aiStore.trainOnAsset(img, false); }"
+              @keep="() => { void handleKeep() }"
+              @delete="() => { void handleArchive() }"
             />
           </div>
 
@@ -216,8 +231,8 @@ onUnmounted(() => {
             class="-mx-4 sm:mx-0"
             :can-undo="canUndo"
             :is-favorite="currentAsset?.isFavorite ?? false"
-            @keep="keepPhoto"
-            @delete="archivePhoto"
+            @keep="handleKeep"
+            @delete="handleArchive"
             @undo="undoLastAction"
             @toggle-favorite="toggleFavorite"
             @open-album-picker="openAlbumPicker"

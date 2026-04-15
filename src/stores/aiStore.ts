@@ -1,29 +1,28 @@
 import { defineStore } from 'pinia';
-import { useImmich } from '@/composables/useImmich';
+import { useAuthStore } from '@/stores/auth';
 
 export const useAiStore = defineStore('aiStore', () => {
-    const immich = useImmich();
+    const authStore = useAuthStore();
 
     function getBackendUrl() {
         return window.location.origin;
     }
 
     function getImmichCredentials() {
-        const headers = immich.getAuthHeaders();
         return {
-            immichUrl: headers['X-Target-Host'],
-            apiKey: headers['x-api-key'],
+            immichUrl: authStore.immichBaseUrl,
+            apiKey: authStore.apiKey,
         };
     }
 
     /**
      * Record a single swipe decision. Fire-and-forget for UI speed.
      */
-    async function trainOnAsset(_image: HTMLImageElement | null, isGood: boolean) {
-        if (!immich.currentAsset.value) return;
+    async function trainOnAsset(assetId: string | null, isGood: boolean) {
+        if (!assetId) return;
         try {
-            const assetId = immich.currentAsset.value.id;
             const { immichUrl, apiKey } = getImmichCredentials();
+            if (!immichUrl || !apiKey) return;
 
             fetch(getBackendUrl() + '/api/swipe', {
                 method: 'POST',
@@ -40,6 +39,7 @@ export const useAiStore = defineStore('aiStore', () => {
      */
     async function trainOnBatch(items: { asset: { id: string }; selected: boolean }[]) {
         const { immichUrl, apiKey } = getImmichCredentials();
+        if (!immichUrl || !apiKey) return;
         try {
             for (const item of items) {
                 await fetch(getBackendUrl() + '/api/swipe', {
@@ -61,9 +61,9 @@ export const useAiStore = defineStore('aiStore', () => {
     /**
      * Fetch 250 scored assets from the backend triage endpoint.
      */
-    async function fetchTriageBatch() {
+    async function fetchTriageBatch(count: number = 60) {
         const { immichUrl, apiKey } = getImmichCredentials();
-        const resp = await fetch(getBackendUrl() + '/api/triage', {
+        const resp = await fetch(`${getBackendUrl()}/api/triage?count=${count}`, {
             headers: {
                 'x-target-host': immichUrl,
                 'x-api-key': apiKey,
@@ -73,5 +73,11 @@ export const useAiStore = defineStore('aiStore', () => {
         return await resp.json();
     }
 
-    return { trainOnAsset, trainOnBatch, fetchTriageBatch };
+    async function fetchStats() {
+        const resp = await fetch(getBackendUrl() + '/api/stats');
+        if (!resp.ok) throw new Error('Failed to fetch training stats.');
+        return await resp.json();
+    }
+
+    return { trainOnAsset, trainOnBatch, fetchTriageBatch, fetchStats };
 });

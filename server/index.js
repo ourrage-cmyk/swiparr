@@ -109,6 +109,42 @@ app.all('/api/immich-proxy/*', async (req, res) => {
 const qdrant = new QdrantClient({ host: process.env.QDRANT_HOST || 'qdrant', port: 6333 });
 const COLLECTION_NAME = 'immich_swipe_vectors';
 let qdrantReady = false;
+let qdrantInitPromise = null;
+const TRIAGE_BATCH_DEFAULT = 60;
+const TRIAGE_BATCH_MAX = 250;
+const TRIAGE_CONCURRENCY = 4;
+const MIN_TRAINING_POINTS = 5;
+const AUTO_ARCHIVE_MIN_POINTS = MIN_TRAINING_POINTS;
+
+async function ensureQdrantReady() {
+    if (qdrantReady) {
+        return true;
+    }
+    if (!qdrantInitPromise) {
+        qdrantInitPromise = setupQdrant().finally(() => {
+            qdrantInitPromise = null;
+        });
+    }
+    await qdrantInitPromise;
+    return qdrantReady;
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+
+    async function worker() {
+        while (nextIndex < items.length) {
+            const currentIndex = nextIndex;
+            nextIndex += 1;
+            results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+        }
+    }
+
+    const workerCount = Math.min(limit, items.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return results.filter(Boolean);
+}
 
 async function setupQdrant() {
     try {
@@ -174,7 +210,7 @@ app.post('/api/swipe', async (req, res) => {
             return res.status(400).json({ error: 'Missing assetId, immichUrl, or apiKey' });
         }
 
-        if (!qdrantReady) {
+        if (!await ensureQdrantReady()) {
             console.warn('[Swipe] Qdrant not ready, storing placeholder');
             return res.json({ success: true, warning: 'Qdrant not ready' });
         }
@@ -207,15 +243,17 @@ app.get('/api/triage', async (req, res) => {
     try {
         const immichUrl = req.headers['x-target-host'];
         const apiKey = req.headers['x-api-key'];
+        const requestedCount = Number.parseInt(String(req.query.count || TRIAGE_BATCH_DEFAULT), 10);
+        const batchSize = Math.min(Math.max(Number.isNaN(requestedCount) ? TRIAGE_BATCH_DEFAULT : requestedCount, 1), TRIAGE_BATCH_MAX);
         if (!immichUrl || !apiKey) {
             return res.status(400).json({ error: 'Missing x-target-host or x-api-key headers' });
         }
 
-        if (!qdrantReady) {
+        if (!await ensureQdrantReady()) {
             console.warn('[Triage] Qdrant not ready, returning random unscored assets');
             const immichBase = immichUrl.endsWith('/') ? immichUrl.slice(0, -1) : immichUrl;
             const headers = { 'x-api-key': apiKey, 'Accept': 'application/json' };
-            const randResp = await fetch(`${immichBase}/api/assets/random?count=250`, { headers });
+            const randResp = await fetch(`${immichBase}/api/assets/random?count=${batchSize}`, { headers });
             if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
             const assets = await randResp.json();
             const scoredAssets = assets
@@ -231,8 +269,8 @@ app.get('/api/triage', async (req, res) => {
         const immichBase = immichUrl.endsWith('/') ? immichUrl.slice(0, -1) : immichUrl;
         const headers = { 'x-api-key': apiKey, 'Accept': 'application/json' };
 
-        // 1. Fetch 250 random assets from Immich
-        const randResp = await fetch(`${immichBase}/api/assets/random?count=250`, { headers });
+        // 1. Fetch a bounded random sample from Immich
+        const randResp = await fetch(`${immichBase}/api/assets/random?count=${batchSize}`, { headers });
         if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
         const assets = await randResp.json();
 
@@ -240,38 +278,41 @@ app.get('/api/triage', async (req, res) => {
         let hasTraining = false;
         try {
             const countRes = await qdrant.count(COLLECTION_NAME, { exact: true });
-            hasTraining = countRes.count >= 5;
+            hasTraining = countRes.count >= MIN_TRAINING_POINTS;
         } catch (_) { /* collection might not exist yet */ }
 
-        // 3. Score each image
-        const scoredAssets = [];
-        for (const asset of assets) {
-            if (asset.type !== 'IMAGE') continue;
-            try {
-                const thumbUrl = `${immichBase}/api/assets/${asset.id}/thumbnail?size=preview`;
-                const embedding = await extractEmbeddingFromUrl(thumbUrl, apiKey);
+        // 3. Score candidate images with limited concurrency
+        const scoredAssets = await mapWithConcurrency(
+            assets.filter(asset => asset.type === 'IMAGE'),
+            TRIAGE_CONCURRENCY,
+            async (asset) => {
+                try {
+                    const thumbUrl = `${immichBase}/api/assets/${asset.id}/thumbnail?size=preview`;
+                    const embedding = await extractEmbeddingFromUrl(thumbUrl, apiKey);
 
-                let score = 0.5; // neutral default
-                if (hasTraining) {
-                    const searchRes = await qdrant.search(COLLECTION_NAME, {
-                        vector: embedding,
-                        limit: 10,
-                        with_payload: true,
-                    });
-                    const top5 = searchRes.slice(0, 5);
-                    const nearestBad = top5.filter(p => p.payload && !p.payload.isKeep).length;
-                    score = 1 - (nearestBad / 5);
+                    let score = 0.5;
+                    if (hasTraining) {
+                        const searchRes = await qdrant.search(COLLECTION_NAME, {
+                            vector: embedding,
+                            limit: 10,
+                            with_payload: true,
+                        });
+                        const top5 = searchRes.slice(0, 5);
+                        const nearestBad = top5.filter(p => p.payload && !p.payload.isKeep).length;
+                        score = 1 - (nearestBad / 5);
+                    }
+
+                    return {
+                        asset,
+                        score,
+                        imgUrl: thumbUrl,
+                    };
+                } catch (e) {
+                    console.error(`[Triage] Skipping asset ${asset.id}:`, e.message);
+                    return null;
                 }
-
-                scoredAssets.push({
-                    asset,
-                    score,
-                    imgUrl: thumbUrl,
-                });
-            } catch (e) {
-                console.error(`[Triage] Skipping asset ${asset.id}:`, e.message);
             }
-        }
+        );
 
         res.json(scoredAssets.sort((a, b) => a.score - b.score));
     } catch (e) {
@@ -286,6 +327,7 @@ app.get('/api/triage', async (req, res) => {
  */
 app.get('/api/stats', async (_req, res) => {
     try {
+        await ensureQdrantReady();
         const countRes = await qdrant.count(COLLECTION_NAME, { exact: true });
         const allPoints = await qdrant.scroll(COLLECTION_NAME, { limit: 10000, with_payload: true });
         const good = allPoints.points.filter(p => p.payload.isKeep).length;
@@ -336,23 +378,29 @@ if (proxyRoute) {
 // I will just re-write the route registration properly in the first chunk instead.
 
 // ---- Background Cron Archiver ----
-const IMMICH_URL = process.env.VITE_SERVER_URL || null;
-const API_KEY = process.env.VITE_USER_1_API_KEY || null;
+const IMMICH_URL = process.env.AUTO_ARCHIVE_IMMICH_URL || process.env.VITE_SERVER_URL || null;
+const API_KEY = process.env.AUTO_ARCHIVE_API_KEY || process.env.VITE_USER_1_API_KEY || null;
 
-async function runAutoArchive() {
-    if (!appSettings.autoArchive) {
-        return;
+async function runAutoArchive(options = {}) {
+    const { force = false, dryRun = false } = options;
+
+    if (!force && !appSettings.autoArchive) {
+        return { skipped: true, reason: 'disabled' };
     }
     if (!IMMICH_URL || !API_KEY) {
         console.log('[Cron] Skipping: VITE_SERVER_URL or VITE_USER_1_API_KEY not set.');
-        return;
+        return { skipped: true, reason: 'missing-env' };
     }
 
     try {
+        if (!await ensureQdrantReady()) {
+            console.log('[Cron] Skipping: Qdrant is not ready.');
+            return { skipped: true, reason: 'qdrant-not-ready' };
+        }
         const countRes = await qdrant.count(COLLECTION_NAME, { exact: true });
-        if (countRes.count < 20) {
-            console.log(`[Cron] Skipping: Only ${countRes.count} vectors in Qdrant (need ≥20).`);
-            return;
+        if (countRes.count < AUTO_ARCHIVE_MIN_POINTS) {
+            console.log(`[Cron] Skipping: Only ${countRes.count} vectors in Qdrant (need ≥${AUTO_ARCHIVE_MIN_POINTS}).`);
+            return { skipped: true, reason: 'not-enough-vectors', vectorCount: countRes.count };
         }
 
         const immichBase = IMMICH_URL.endsWith('/') ? IMMICH_URL.slice(0, -1) : IMMICH_URL;
@@ -384,19 +432,36 @@ async function runAutoArchive() {
         }
 
         if (badAssetIds.length > 0) {
-            console.log(`[Cron] Archiving ${badAssetIds.length} bad assets.`);
-            await fetch(`${immichBase}/api/assets`, {
-                method: 'PUT',
-                headers: { ...headers, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ids: badAssetIds, isArchived: true }),
-            });
+            if (dryRun) {
+                console.log(`[Cron] Dry run selected ${badAssetIds.length} bad assets.`);
+            } else {
+                console.log(`[Cron] Archiving ${badAssetIds.length} bad assets.`);
+                await fetch(`${immichBase}/api/assets`, {
+                    method: 'PUT',
+                    headers: { ...headers, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ids: badAssetIds, isArchived: true }),
+                });
+            }
+            return { skipped: false, archivedCount: badAssetIds.length, archivedIds: badAssetIds };
         } else {
             console.log('[Cron] No bad assets found this cycle.');
+            return { skipped: false, archivedCount: 0, archivedIds: [] };
         }
     } catch (e) {
         console.error('[Cron] Error:', e.message);
+        throw e;
     }
 }
+
+app.post('/api/auto-archive/run', async (req, res) => {
+    try {
+        const dryRun = req.query.dryRun === '1' || req.query.dryRun === 'true';
+        const result = await runAutoArchive({ force: true, dryRun });
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
 
 // Run hourly
 cron.schedule('0 * * * *', runAutoArchive);

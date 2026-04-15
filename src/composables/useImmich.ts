@@ -355,12 +355,9 @@ export function useImmich() {
       if (nextAsset.value) {
         const url = getAssetThumbnailUrl(nextAsset.value.id, 'preview')
         if (!url) return
-        fetch(url, {
-          headers: {
-            'x-api-key': authStore.apiKey,
-            'X-Target-Host': authStore.immichBaseUrl,
-          },
-        }).catch(() => {})
+        const img = new Image()
+        img.decoding = 'async'
+        img.src = url
       }
     } catch (e) {
       console.error('Failed to preload next asset:', e)
