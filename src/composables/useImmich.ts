@@ -8,6 +8,7 @@ import type {
   ImmichAlbum,
   MetadataSearchRequest,
   MetadataSearchResponse,
+  ScoredAsset,
 } from '@/types/immich'
 
 export function useImmich() {
@@ -25,6 +26,12 @@ export function useImmich() {
   const CHRONO_PAGE_SIZE = 50
   const RANDOM_BATCH_SIZE = 5
   const RANDOM_MAX_ATTEMPTS = 20
+  const UNCERTAIN_QUEUE_TARGET = 12
+  const UNCERTAIN_QUEUE_REFILL_THRESHOLD = 4
+  const UNCERTAIN_SCAN_BATCH_SIZE = 40
+  const UNCERTAIN_SCAN_BATCHES = 4
+  const UNCERTAIN_MIN_SCORE = 0.3
+  const UNCERTAIN_MAX_SCORE = 0.6
   const ARCHIVE_VISIBILITY = 'archive'
   const TIMELINE_VISIBILITY = 'timeline'
 
@@ -32,6 +39,8 @@ export function useImmich() {
   const ARCHIVED_ALBUM_NAME = 'archived'
 
   const chronologicalQueue = ref<ImmichAsset[]>([])
+  const uncertainQueue = ref<ScoredAsset[]>([])
+  const isRefillingUncertainQueue = ref(false)
   const chronologicalSkip = ref(0)
   const chronologicalPage = ref<number | null>(1)
   const chronologicalPagingMode = ref<'skip' | 'page' | null>(null)
@@ -59,6 +68,8 @@ export function useImmich() {
 
   function resetReviewFlow() {
     chronologicalQueue.value = []
+    uncertainQueue.value = []
+    isRefillingUncertainQueue.value = false
     chronologicalSkip.value = 0
     chronologicalPage.value = 1
     chronologicalPagingMode.value = null
@@ -169,9 +180,87 @@ export function useImmich() {
     }
   }
 
+  function dequeueUncertainAsset(): ImmichAsset | null {
+    while (uncertainQueue.value.length > 0) {
+      const candidate = uncertainQueue.value.shift()
+      if (candidate && isReviewable(candidate.asset)) {
+        return candidate.asset
+      }
+    }
+
+    return null
+  }
+
+  async function fetchReviewCandidates(): Promise<ScoredAsset[]> {
+    const query = new URLSearchParams({
+      count: String(UNCERTAIN_QUEUE_TARGET),
+      scanBatchSize: String(UNCERTAIN_SCAN_BATCH_SIZE),
+      scanBatches: String(UNCERTAIN_SCAN_BATCHES),
+      minScore: String(UNCERTAIN_MIN_SCORE),
+      maxScore: String(UNCERTAIN_MAX_SCORE),
+    })
+    const response = await fetch(`${window.location.origin}/api/review-candidates?${query.toString()}`, {
+      headers: {
+        'x-api-key': authStore.apiKey,
+        'x-target-host': authStore.immichBaseUrl,
+      },
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(errorText || 'Failed to fetch review candidates')
+    }
+
+    const payload = await response.json() as unknown
+    const items = Array.isArray(payload) ? payload as ScoredAsset[] : []
+    return items.filter((item) => item && item.asset && isReviewable(item.asset))
+  }
+
+  async function refillUncertainQueue(force: boolean = false): Promise<void> {
+    if (preferencesStore.reviewOrder !== 'random') return
+    if (isRefillingUncertainQueue.value) return
+    if (!force && uncertainQueue.value.length >= UNCERTAIN_QUEUE_REFILL_THRESHOLD) return
+
+    isRefillingUncertainQueue.value = true
+    try {
+      const candidates = await fetchReviewCandidates()
+      if (candidates.length === 0) {
+        return
+      }
+
+      const seenIds = new Set(uncertainQueue.value.map((item) => item.asset.id))
+      const merged = [...uncertainQueue.value]
+      for (const candidate of candidates) {
+        if (seenIds.has(candidate.asset.id)) continue
+        seenIds.add(candidate.asset.id)
+        merged.push(candidate)
+      }
+      uncertainQueue.value = merged.slice(0, UNCERTAIN_QUEUE_TARGET)
+    } catch (e) {
+      console.error('Failed to refill uncertain review queue:', e)
+    } finally {
+      isRefillingUncertainQueue.value = false
+    }
+  }
+
   // Fetch a random asset
   async function fetchRandomAsset(): Promise<ImmichAsset | null> {
     try {
+      if (uncertainQueue.value.length > 0) {
+        const queued = dequeueUncertainAsset()
+        if (queued) {
+          void refillUncertainQueue()
+          return queued
+        }
+      }
+
+      await refillUncertainQueue(true)
+      const uncertainCandidate = dequeueUncertainAsset()
+      if (uncertainCandidate) {
+        void refillUncertainQueue()
+        return uncertainCandidate
+      }
+
       const attempts = uiStore.skipVideos ? SKIP_VIDEOS_MAX_ATTEMPTS : RANDOM_MAX_ATTEMPTS
       for (let attempt = 0; attempt < attempts; attempt++) {
         const count = uiStore.skipVideos ? SKIP_VIDEOS_BATCH_SIZE : RANDOM_BATCH_SIZE
@@ -367,6 +456,10 @@ export function useImmich() {
   async function preloadNextAsset(): Promise<void> {
     try {
       nextAsset.value = await fetchNextAsset()
+
+      if (preferencesStore.reviewOrder === 'random') {
+        void refillUncertainQueue()
+      }
 
       if (nextAsset.value) {
         const url = getAssetThumbnailUrl(nextAsset.value.id, 'preview')

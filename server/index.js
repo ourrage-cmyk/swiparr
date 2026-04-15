@@ -117,6 +117,19 @@ const TRIAGE_BATCH_MIN = 12;
 const TRIAGE_BATCH_MAX = 250;
 const TRIAGE_CONCURRENCY = 4;
 const MIN_TRAINING_POINTS = 5;
+const SCORE_SEARCH_LIMIT = 128;
+const SCORE_NEIGHBOR_COUNT = 24;
+const REVIEW_CANDIDATE_TARGET_DEFAULT = 12;
+const REVIEW_CANDIDATE_TARGET_MIN = 4;
+const REVIEW_CANDIDATE_TARGET_MAX = 40;
+const REVIEW_CANDIDATE_SCAN_BATCH_SIZE = 40;
+const REVIEW_CANDIDATE_SCAN_BATCH_MIN = 10;
+const REVIEW_CANDIDATE_SCAN_BATCH_MAX = 80;
+const REVIEW_CANDIDATE_SCAN_BATCHES_DEFAULT = 4;
+const REVIEW_CANDIDATE_SCAN_BATCHES_MIN = 1;
+const REVIEW_CANDIDATE_SCAN_BATCHES_MAX = 10;
+const REVIEW_CANDIDATE_MIN_SCORE_DEFAULT = 0.3;
+const REVIEW_CANDIDATE_MAX_SCORE_DEFAULT = 0.6;
 const AUTO_ARCHIVE_MIN_POINTS = MIN_TRAINING_POINTS;
 const MANUAL_SOURCE = 'manual';
 const AUTO_ARCHIVE_CRON_DEFAULT = '0 * * * *';
@@ -216,12 +229,34 @@ async function extractEmbeddingFromUrl(imageUrl, apiKey) {
 }
 
 function scoreFromNeighbors(searchRes) {
-    const top5 = searchRes.slice(0, 5);
-    if (top5.length === 0) {
+    const neighbors = searchRes.slice(0, SCORE_NEIGHBOR_COUNT);
+    if (neighbors.length === 0) {
         return 0.5;
     }
-    const nearestBad = top5.filter(p => p.payload && !p.payload.isKeep).length;
-    return 1 - (nearestBad / top5.length);
+
+    let keepWeight = 0;
+    let badWeight = 0;
+
+    for (const point of neighbors) {
+        const similarity = Math.max(0, Number(point?.score) || 0);
+        const weight = similarity * similarity;
+        if (weight === 0) {
+            continue;
+        }
+
+        if (point.payload?.isKeep) {
+            keepWeight += weight;
+        } else {
+            badWeight += weight;
+        }
+    }
+
+    const totalWeight = keepWeight + badWeight;
+    if (totalWeight === 0) {
+        return 0.5;
+    }
+
+    return keepWeight / totalWeight;
 }
 
 function isManualTrainingPoint(point) {
@@ -245,7 +280,7 @@ async function getTrainingStats() {
 
 async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
     return mapWithConcurrency(
-        assets.filter(asset => asset.type === 'IMAGE' && !asset.isArchived),
+        assets.filter(asset => asset.type === 'IMAGE' && !asset.isArchived && !asset.isTrashed && asset.visibility !== ARCHIVE_VISIBILITY),
         TRIAGE_CONCURRENCY,
         async (asset) => {
             try {
@@ -256,7 +291,7 @@ async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
                 if (hasTraining) {
                     const searchRes = await qdrant.search(COLLECTION_NAME, {
                         vector: embedding,
-                        limit: 50,
+                        limit: SCORE_SEARCH_LIMIT,
                         with_payload: true,
                     });
                     score = scoreFromNeighbors(searchRes.filter(isManualTrainingPoint));
@@ -293,6 +328,14 @@ function clampNumber(value, min, max, fallback) {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) return fallback;
     return Math.min(Math.max(parsed, min), max);
+}
+
+function fetchRandomTimelineAssets(immichBase, headers, size) {
+    return fetch(`${immichBase}/api/search/random`, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ size, visibility: TIMELINE_VISIBILITY }),
+    });
 }
 
 function sanitizeSettings(raw = {}) {
@@ -486,11 +529,7 @@ app.get('/api/triage', async (req, res) => {
             console.warn('[Triage] Qdrant not ready, returning random unscored assets');
             const immichBase = immichUrl.endsWith('/') ? immichUrl.slice(0, -1) : immichUrl;
             const headers = { 'x-api-key': apiKey, 'Accept': 'application/json' };
-            const randResp = await fetch(`${immichBase}/api/search/random`, {
-                method: 'POST',
-                headers: { ...headers, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ size: batchSize, visibility: TIMELINE_VISIBILITY }),
-            });
+            const randResp = await fetchRandomTimelineAssets(immichBase, headers, batchSize);
             if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
             const assets = await randResp.json();
             const scoredAssets = assets
@@ -507,11 +546,7 @@ app.get('/api/triage', async (req, res) => {
         const headers = { 'x-api-key': apiKey, 'Accept': 'application/json' };
 
         // 1. Fetch a bounded random sample from Immich
-        const randResp = await fetch(`${immichBase}/api/search/random`, {
-            method: 'POST',
-            headers: { ...headers, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ size: batchSize, visibility: TIMELINE_VISIBILITY }),
-        });
+        const randResp = await fetchRandomTimelineAssets(immichBase, headers, batchSize);
         if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
         const assets = await randResp.json();
 
@@ -528,6 +563,71 @@ app.get('/api/triage', async (req, res) => {
         res.json(scoredAssets.sort((a, b) => a.score - b.score));
     } catch (e) {
         console.error('[Triage] Error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/review-candidates', async (req, res) => {
+    try {
+        const immichUrl = req.headers['x-target-host'];
+        const apiKey = req.headers['x-api-key'];
+        const requestedCount = Number.parseInt(String(req.query.count ?? REVIEW_CANDIDATE_TARGET_DEFAULT), 10);
+        const requestedScanBatchSize = Number.parseInt(String(req.query.scanBatchSize ?? REVIEW_CANDIDATE_SCAN_BATCH_SIZE), 10);
+        const requestedScanBatches = Number.parseInt(String(req.query.scanBatches ?? REVIEW_CANDIDATE_SCAN_BATCHES_DEFAULT), 10);
+        const minScore = clampNumber(req.query.minScore, 0, 1, REVIEW_CANDIDATE_MIN_SCORE_DEFAULT);
+        const maxScore = clampNumber(req.query.maxScore, minScore, 1, REVIEW_CANDIDATE_MAX_SCORE_DEFAULT);
+        const targetCount = clampInteger(requestedCount, REVIEW_CANDIDATE_TARGET_MIN, REVIEW_CANDIDATE_TARGET_MAX, REVIEW_CANDIDATE_TARGET_DEFAULT);
+        const scanBatchSize = clampInteger(requestedScanBatchSize, REVIEW_CANDIDATE_SCAN_BATCH_MIN, REVIEW_CANDIDATE_SCAN_BATCH_MAX, REVIEW_CANDIDATE_SCAN_BATCH_SIZE);
+        const scanBatches = clampInteger(requestedScanBatches, REVIEW_CANDIDATE_SCAN_BATCHES_MIN, REVIEW_CANDIDATE_SCAN_BATCHES_MAX, REVIEW_CANDIDATE_SCAN_BATCHES_DEFAULT);
+
+        if (!immichUrl || !apiKey) {
+            return res.status(400).json({ error: 'Missing x-target-host or x-api-key headers' });
+        }
+
+        const immichBase = immichUrl.endsWith('/') ? immichUrl.slice(0, -1) : immichUrl;
+        const headers = { 'x-api-key': apiKey, 'Accept': 'application/json' };
+        let hasTraining = false;
+
+        if (await ensureQdrantReady()) {
+            try {
+                const trainingStats = await getTrainingStats();
+                hasTraining = trainingStats.total >= MIN_TRAINING_POINTS;
+            } catch (_) {
+                hasTraining = false;
+            }
+        }
+
+        if (!hasTraining) {
+            return res.json([]);
+        }
+
+        const candidateMap = new Map();
+        for (let batchIndex = 0; batchIndex < scanBatches; batchIndex += 1) {
+            const randResp = await fetchRandomTimelineAssets(immichBase, headers, scanBatchSize);
+            if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
+            const assets = await randResp.json();
+            for (const asset of assets) {
+                if (asset.type === 'IMAGE' && !asset.isTrashed && asset.visibility !== ARCHIVE_VISIBILITY && !asset.isArchived) {
+                    candidateMap.set(asset.id, asset);
+                }
+            }
+        }
+
+        const scoredAssets = await scoreAssets({
+            assets: Array.from(candidateMap.values()),
+            immichBase,
+            apiKey,
+            hasTraining: true,
+        });
+
+        const candidates = scoredAssets
+            .filter((item) => item.score >= minScore && item.score <= maxScore)
+            .sort((left, right) => Math.abs(left.score - 0.5) - Math.abs(right.score - 0.5))
+            .slice(0, targetCount);
+
+        res.json(candidates);
+    } catch (e) {
+        console.error('[ReviewCandidates] Error:', e.message);
         res.status(500).json({ error: e.message });
     }
 });
@@ -682,11 +782,7 @@ async function runAutoArchive(options = {}) {
         const scanBatchSize = Number(appSettings.autoArchiveScanBatchSize ?? AUTO_ARCHIVE_SCAN_BATCH_SIZE);
         const scanBatchesPerRun = Number(appSettings.autoArchiveScanBatchesPerRun ?? AUTO_ARCHIVE_BATCHES_PER_RUN);
         for (let batchIndex = 0; batchIndex < scanBatchesPerRun; batchIndex += 1) {
-            const randResp = await fetch(`${immichBase}/api/search/random`, {
-                method: 'POST',
-                headers: { ...headers, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ size: scanBatchSize, visibility: TIMELINE_VISIBILITY }),
-            });
+            const randResp = await fetchRandomTimelineAssets(immichBase, headers, scanBatchSize);
             if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
             const assets = await randResp.json();
             for (const asset of assets) {

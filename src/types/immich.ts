@@ -31,6 +31,12 @@ export interface ImmichAsset {
   }
 }
 
+export interface ScoredAsset {
+  asset: ImmichAsset
+  score: number
+  imgUrl?: string
+}
+
 export interface ImmichConfig {
   serverUrl: string
   apiKey: string
