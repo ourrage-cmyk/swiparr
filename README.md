@@ -134,7 +134,7 @@ services:
       - /mnt/SSDCAGE/swiparr/qdrant:/qdrant/storage
 
   immich-swipe:
-    image: goethenorris/swiparr:v6
+    image: goethenorris/swiparr:v7
     container_name: immich-swipe
     restart: unless-stopped
     depends_on:
