@@ -27,7 +27,7 @@ export const useAiStore = defineStore('aiStore', () => {
             fetch(getBackendUrl() + '/api/swipe', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ assetId, immichUrl, apiKey, isKeep: isGood }),
+                body: JSON.stringify({ assetId, immichUrl, apiKey, isKeep: isGood, source: 'manual' }),
             });
         } catch (e) {
             console.error('[AI] Swipe error:', e);
@@ -50,6 +50,7 @@ export const useAiStore = defineStore('aiStore', () => {
                         immichUrl,
                         apiKey,
                         isKeep: !item.selected, // selected = bad in Triage UI
+                        source: 'manual',
                     }),
                 });
             }

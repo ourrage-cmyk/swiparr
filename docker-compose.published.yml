@@ -6,7 +6,7 @@ services:
     ports:
       - "6333:6333"
     volumes:
-      - /mnt/SSDCAGE/swiparr/qdrant:/qdrant/storage
+      - qdrant_storage:/qdrant/storage
 
   immich-swipe:
     image: goethenorris/swiparr:v2
@@ -22,5 +22,10 @@ services:
       AUTO_ARCHIVE_IMMICH_URL: ${AUTO_ARCHIVE_IMMICH_URL:-}
       AUTO_ARCHIVE_API_KEY: ${AUTO_ARCHIVE_API_KEY:-}
     volumes:
-      - /mnt/SSDCAGE/swiparr/config:/data
-      - /mnt/SSDCAGE/swiparr/data:/app/models
+      - swiparr_data:/data
+      - swiparr_models:/app/models
+
+volumes:
+  qdrant_storage:
+  swiparr_data:
+  swiparr_models:

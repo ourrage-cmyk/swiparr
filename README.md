@@ -1,6 +1,6 @@
 # Immich Swipe
 
-Swipe-review your Immich library: right = keep, left = trash. Like a dating app, but for photos (and videos).
+Swipe-review your Immich library: right = keep, left = archive. It adds manual training vectors, scores new photos with CLIP + Qdrant, and can auto-archive high-confidence bad matches on a cron schedule.
 
 ![Vue 3](https://img.shields.io/badge/Vue-3.x-4FC08D?logo=vue.js)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript)
@@ -30,6 +30,24 @@ Swipe-review your Immich library: right = keep, left = trash. Like a dating app,
 - Undo (Ctrl/⌘+Z or ↑)
 - Reviewed cache + stats persisted per server/user
 - Preloads the next asset
+- Manual training vectors stored in Qdrant
+- Triage grid for batch review and training
+- Toggleable server-side cron auto-archive
+- User-controlled auto-archive threshold in the web UI
+- Auto-archive never writes its own decisions back into training
+
+## How It Works
+
+1. Review photos manually in the swipe UI.
+2. Manual keep/archive decisions are embedded with CLIP and stored in Qdrant.
+3. The app scores fresh photos by comparing them against those manual vectors.
+4. The triage page lets you review a scored batch and add more manual training examples.
+5. If cron auto-archive is enabled, the server periodically scans a batch of photos and archives only the ones below your chosen threshold.
+
+Important:
+- Only manual actions contribute to training.
+- Auto-archived photos do not train the model.
+- The threshold is most useful after at least 5 manual training decisions.
 
 ## Controls
 
@@ -70,7 +88,7 @@ If you want to use the published image without rebuilding locally:
 
 ```bash
 cp env.example .env
-docker compose -f docker-compose.template.yml up -d
+docker compose -f docker-compose.published.yml up -d
 ```
 
 Open `http://localhost:8080`.
@@ -78,6 +96,60 @@ Open `http://localhost:8080`.
 Behavior:
 - Login is done manually in the web UI unless you build your own image with `VITE_*` values.
 - Server-side auto-archive can still run from the published image when `AUTO_ARCHIVE_IMMICH_URL` and `AUTO_ARCHIVE_API_KEY` are set in `.env`.
+- Auto-archive only uses manual training vectors. Photos archived by cron are never written back into the training set.
+- GUI settings such as the cron toggle and threshold persist in the `swiparr_data` Docker volume.
+
+### First-time setup checklist
+
+1. Start the stack.
+2. Open `http://localhost:8080`.
+3. Log into Immich in the web UI, or build your own image with `VITE_*` values.
+4. Swipe through some photos manually to create training data.
+5. Open the Automatic Cleanup / Triage screen to inspect scores.
+6. Enable cron auto-archive in the home screen once you are comfortable with the threshold.
+
+### FreeNAS / TrueNAS bind-mount example
+
+If you want fixed host paths instead of Docker-managed volumes, create:
+
+```bash
+mkdir -p /mnt/SSDCAGE/swiparr/qdrant
+mkdir -p /mnt/SSDCAGE/swiparr/config
+mkdir -p /mnt/SSDCAGE/swiparr/data
+```
+
+Then use:
+
+```yaml
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: immich-swipe-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - /mnt/SSDCAGE/swiparr/qdrant:/qdrant/storage
+
+  immich-swipe:
+    image: goethenorris/swiparr:v2
+    container_name: immich-swipe
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    ports:
+      - "8080:80"
+    environment:
+      QDRANT_HOST: qdrant
+      APP_DATA_DIR: /data
+      AUTO_ARCHIVE_IMMICH_URL: ${AUTO_ARCHIVE_IMMICH_URL:-}
+      AUTO_ARCHIVE_API_KEY: ${AUTO_ARCHIVE_API_KEY:-}
+    volumes:
+      - /mnt/SSDCAGE/swiparr/config:/data
+      - /mnt/SSDCAGE/swiparr/data:/app/models
+```
+
+    The repository includes that FreeNAS-oriented bind-mount version in `docker-compose.template.yml`.
 
 ### GitHub Pages
 
@@ -118,6 +190,13 @@ Security note: `VITE_*` variables are embedded into the compiled frontend. Only 
 
 For the published Docker image, prefer `AUTO_ARCHIVE_IMMICH_URL` and `AUTO_ARCHIVE_API_KEY` for backend-only automation. These are read at runtime by the Node server and are not needed for manual UI login.
 
+Required for server-side cron auto-archive:
+
+```bash
+AUTO_ARCHIVE_IMMICH_URL=https://immich.example.com
+AUTO_ARCHIVE_API_KEY=your-api-key
+```
+
 ### Option B: manual login (runtime)
 
 If you don’t configure `.env` users, the app asks for:
@@ -157,9 +236,24 @@ See also: https://docs.immich.app/administration/reverse-proxy/
 
 Minimum:
 - `asset.read`
-- `asset.delete`
+- `asset.update`
 
 If you want albums and favorites, grant the corresponding read/update permissions as well.
+
+## Training And Cron Notes
+
+- The model starts with no knowledge on first run.
+- Manual swipes and manual triage submissions are the only source of training vectors.
+- Cron auto-archive uses your saved threshold from the home screen.
+- Lower thresholds are stricter. Higher thresholds archive more aggressively.
+- If you want to validate behavior safely, use the UI threshold first and build a few dozen manual decisions before relying on cron.
+
+## Troubleshooting
+
+- Images load slowly on first use: the model and proxy cache need to warm up.
+- Auto-archive is enabled but does nothing: confirm `AUTO_ARCHIVE_IMMICH_URL` and `AUTO_ARCHIVE_API_KEY` are set, and confirm you have enough manual training data.
+- Threshold changes are lost after restart: use the published compose template or a bind-mounted config path so `/data/settings.json` persists.
+- The published image does not auto-login: that is expected unless you build your own image with `VITE_*` build args.
 
 ## Development scripts
 

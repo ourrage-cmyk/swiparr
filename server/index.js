@@ -13,6 +13,7 @@ transformersEnv.localModelPath = path.join(process.cwd(), 'models');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const APP_DATA_DIR = process.env.APP_DATA_DIR || __dirname;
 
 const app = express();
 app.use(cors());
@@ -115,6 +116,11 @@ const TRIAGE_BATCH_MAX = 250;
 const TRIAGE_CONCURRENCY = 4;
 const MIN_TRAINING_POINTS = 5;
 const AUTO_ARCHIVE_MIN_POINTS = MIN_TRAINING_POINTS;
+const MANUAL_SOURCE = 'manual';
+const AUTO_ARCHIVE_SCAN_BATCH_SIZE = 40;
+const AUTO_ARCHIVE_BATCHES_PER_RUN = 3;
+const AUTO_ARCHIVE_ARCHIVE_BATCH_SIZE = 25;
+const AUTO_ARCHIVE_CONFIDENCE_THRESHOLD = 0.2;
 
 async function ensureQdrantReady() {
     if (qdrantReady) {
@@ -197,6 +203,132 @@ async function extractEmbeddingFromUrl(imageUrl, apiKey) {
     return Array.from(output.data);
 }
 
+function scoreFromNeighbors(searchRes) {
+    const top5 = searchRes.slice(0, 5);
+    if (top5.length === 0) {
+        return 0.5;
+    }
+    const nearestBad = top5.filter(p => p.payload && !p.payload.isKeep).length;
+    return 1 - (nearestBad / top5.length);
+}
+
+function isManualTrainingPoint(point) {
+    return !point?.payload?.source || point.payload.source === MANUAL_SOURCE;
+}
+
+async function getTrainingStats() {
+    const allPoints = await qdrant.scroll(COLLECTION_NAME, {
+        limit: 10000,
+        with_payload: true,
+    });
+    const manualPoints = allPoints.points.filter(isManualTrainingPoint);
+    const good = manualPoints.filter(point => point.payload.isKeep).length;
+    const bad = manualPoints.filter(point => !point.payload.isKeep).length;
+    return {
+        total: manualPoints.length,
+        good,
+        bad,
+    };
+}
+
+async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
+    return mapWithConcurrency(
+        assets.filter(asset => asset.type === 'IMAGE' && !asset.isArchived),
+        TRIAGE_CONCURRENCY,
+        async (asset) => {
+            try {
+                const thumbUrl = `${immichBase}/api/assets/${asset.id}/thumbnail?size=preview`;
+                const embedding = await extractEmbeddingFromUrl(thumbUrl, apiKey);
+
+                let score = 0.5;
+                if (hasTraining) {
+                    const searchRes = await qdrant.search(COLLECTION_NAME, {
+                        vector: embedding,
+                        limit: 50,
+                        with_payload: true,
+                    });
+                    score = scoreFromNeighbors(searchRes.filter(isManualTrainingPoint));
+                }
+
+                return {
+                    asset,
+                    score,
+                    imgUrl: thumbUrl,
+                };
+            } catch (e) {
+                console.error(`[Scoring] Skipping asset ${asset.id}:`, e.message);
+                return null;
+            }
+        }
+    );
+}
+
+function chunkItems(items, chunkSize) {
+    const chunks = [];
+    for (let index = 0; index < items.length; index += chunkSize) {
+        chunks.push(items.slice(index, index + chunkSize));
+    }
+    return chunks;
+}
+
+async function fetchAssetDetails(immichBase, apiKey, assetId) {
+    const response = await fetch(`${immichBase}/api/assets/${assetId}`, {
+        headers: {
+            'x-api-key': apiKey,
+            'Accept': 'application/json',
+        },
+    });
+
+    if (!response.ok) {
+        throw new Error(`Immich asset lookup failed for ${assetId}: ${response.status}`);
+    }
+
+    return response.json();
+}
+
+async function archiveAssetBatch(immichBase, headers, assetIds) {
+    const response = await fetch(`${immichBase}/api/assets`, {
+        method: 'PUT',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: assetIds, isArchived: true }),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`Immich archive request failed (${response.status}): ${errorText}`);
+    }
+}
+
+async function archiveAssetsWithVerification({ immichBase, headers, apiKey, assetIds }) {
+    const verifiedArchivedIds = [];
+
+    for (const batchIds of chunkItems(assetIds, AUTO_ARCHIVE_ARCHIVE_BATCH_SIZE)) {
+        await archiveAssetBatch(immichBase, headers, batchIds);
+
+        for (const assetId of batchIds) {
+            try {
+                const details = await fetchAssetDetails(immichBase, apiKey, assetId);
+                if (details.isArchived) {
+                    verifiedArchivedIds.push(assetId);
+                    continue;
+                }
+
+                await archiveAssetBatch(immichBase, headers, [assetId]);
+                const retriedDetails = await fetchAssetDetails(immichBase, apiKey, assetId);
+                if (retriedDetails.isArchived) {
+                    verifiedArchivedIds.push(assetId);
+                } else {
+                    console.warn(`[Cron] Asset ${assetId} did not verify as archived after retry.`);
+                }
+            } catch (error) {
+                console.warn(`[Cron] Verification failed for ${assetId}: ${error.message}`);
+            }
+        }
+    }
+
+    return verifiedArchivedIds;
+}
+
 // ---- API Routes ----
 
 /**
@@ -205,9 +337,12 @@ async function extractEmbeddingFromUrl(imageUrl, apiKey) {
  */
 app.post('/api/swipe', async (req, res) => {
     try {
-        const { assetId, immichUrl, apiKey, isKeep } = req.body;
+        const { assetId, immichUrl, apiKey, isKeep, source = MANUAL_SOURCE } = req.body;
         if (!assetId || !immichUrl || !apiKey) {
             return res.status(400).json({ error: 'Missing assetId, immichUrl, or apiKey' });
+        }
+        if (source !== MANUAL_SOURCE) {
+            return res.status(400).json({ error: 'Only manual training writes are accepted' });
         }
 
         if (!await ensureQdrantReady()) {
@@ -224,7 +359,11 @@ app.post('/api/swipe', async (req, res) => {
             points: [{
                 id: assetId,          // Qdrant JS client supports UUID strings
                 vector: embedding,
-                payload: { isKeep },
+                payload: {
+                    isKeep,
+                    source: MANUAL_SOURCE,
+                    trainedAt: new Date().toISOString(),
+                },
             }],
         });
         res.json({ success: true });
@@ -277,42 +416,12 @@ app.get('/api/triage', async (req, res) => {
         // 2. Check how much training data we have
         let hasTraining = false;
         try {
-            const countRes = await qdrant.count(COLLECTION_NAME, { exact: true });
-            hasTraining = countRes.count >= MIN_TRAINING_POINTS;
+            const trainingStats = await getTrainingStats();
+            hasTraining = trainingStats.total >= MIN_TRAINING_POINTS;
         } catch (_) { /* collection might not exist yet */ }
 
         // 3. Score candidate images with limited concurrency
-        const scoredAssets = await mapWithConcurrency(
-            assets.filter(asset => asset.type === 'IMAGE'),
-            TRIAGE_CONCURRENCY,
-            async (asset) => {
-                try {
-                    const thumbUrl = `${immichBase}/api/assets/${asset.id}/thumbnail?size=preview`;
-                    const embedding = await extractEmbeddingFromUrl(thumbUrl, apiKey);
-
-                    let score = 0.5;
-                    if (hasTraining) {
-                        const searchRes = await qdrant.search(COLLECTION_NAME, {
-                            vector: embedding,
-                            limit: 10,
-                            with_payload: true,
-                        });
-                        const top5 = searchRes.slice(0, 5);
-                        const nearestBad = top5.filter(p => p.payload && !p.payload.isKeep).length;
-                        score = 1 - (nearestBad / 5);
-                    }
-
-                    return {
-                        asset,
-                        score,
-                        imgUrl: thumbUrl,
-                    };
-                } catch (e) {
-                    console.error(`[Triage] Skipping asset ${asset.id}:`, e.message);
-                    return null;
-                }
-            }
-        );
+        const scoredAssets = await scoreAssets({ assets, immichBase, apiKey, hasTraining });
 
         res.json(scoredAssets.sort((a, b) => a.score - b.score));
     } catch (e) {
@@ -328,19 +437,21 @@ app.get('/api/triage', async (req, res) => {
 app.get('/api/stats', async (_req, res) => {
     try {
         await ensureQdrantReady();
-        const countRes = await qdrant.count(COLLECTION_NAME, { exact: true });
-        const allPoints = await qdrant.scroll(COLLECTION_NAME, { limit: 10000, with_payload: true });
-        const good = allPoints.points.filter(p => p.payload.isKeep).length;
-        const bad = allPoints.points.filter(p => !p.payload.isKeep).length;
-        res.json({ total: countRes.count, good, bad });
+        res.json(await getTrainingStats());
     } catch (e) {
         res.json({ total: 0, good: 0, bad: 0 });
     }
 });
 
 // ---- Settings persistence ----
-const SETTINGS_FILE = path.join(__dirname, 'settings.json');
-let appSettings = { autoArchive: false };
+const SETTINGS_FILE = path.join(APP_DATA_DIR, 'settings.json');
+let appSettings = {
+    autoArchive: false,
+    autoArchiveConfidenceThreshold: AUTO_ARCHIVE_CONFIDENCE_THRESHOLD,
+    autoArchiveBatchSize: AUTO_ARCHIVE_ARCHIVE_BATCH_SIZE,
+};
+
+fs.mkdirSync(APP_DATA_DIR, { recursive: true });
 
 function loadSettings() {
     try {
@@ -397,55 +508,72 @@ async function runAutoArchive(options = {}) {
             console.log('[Cron] Skipping: Qdrant is not ready.');
             return { skipped: true, reason: 'qdrant-not-ready' };
         }
-        const countRes = await qdrant.count(COLLECTION_NAME, { exact: true });
-        if (countRes.count < AUTO_ARCHIVE_MIN_POINTS) {
-            console.log(`[Cron] Skipping: Only ${countRes.count} vectors in Qdrant (need ≥${AUTO_ARCHIVE_MIN_POINTS}).`);
-            return { skipped: true, reason: 'not-enough-vectors', vectorCount: countRes.count };
+        const trainingStats = await getTrainingStats();
+        if (trainingStats.total < AUTO_ARCHIVE_MIN_POINTS) {
+            console.log(`[Cron] Skipping: Only ${trainingStats.total} vectors in Qdrant (need ≥${AUTO_ARCHIVE_MIN_POINTS}).`);
+            return { skipped: true, reason: 'not-enough-vectors', vectorCount: trainingStats.total };
         }
 
         const immichBase = IMMICH_URL.endsWith('/') ? IMMICH_URL.slice(0, -1) : IMMICH_URL;
         const headers = { 'x-api-key': API_KEY, 'Accept': 'application/json' };
 
-        const randResp = await fetch(`${immichBase}/api/assets/random?count=50`, { headers });
-        if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
-        const assets = await randResp.json();
-
-        const badAssetIds = [];
-        for (const asset of assets) {
-            if (asset.type !== 'IMAGE') continue;
-            try {
-                const thumbUrl = `${immichBase}/api/assets/${asset.id}/thumbnail?size=preview`;
-                const embedding = await extractEmbeddingFromUrl(thumbUrl, API_KEY);
-
-                const searchRes = await qdrant.search(COLLECTION_NAME, {
-                    vector: embedding,
-                    limit: 10,
-                    with_payload: true,
-                });
-                const nearestBad = searchRes.slice(0, 5).filter(p => !p.payload.isKeep).length;
-                if (nearestBad >= 4) {
-                    badAssetIds.push(asset.id);
+        const candidateMap = new Map();
+        for (let batchIndex = 0; batchIndex < AUTO_ARCHIVE_BATCHES_PER_RUN; batchIndex += 1) {
+            const randResp = await fetch(`${immichBase}/api/assets/random?count=${AUTO_ARCHIVE_SCAN_BATCH_SIZE}`, { headers });
+            if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
+            const assets = await randResp.json();
+            for (const asset of assets) {
+                if (asset.type === 'IMAGE' && !asset.isArchived) {
+                    candidateMap.set(asset.id, asset);
                 }
-            } catch (e) {
-                // skip individual asset errors
             }
         }
+
+        const scoredAssets = await scoreAssets({
+            assets: Array.from(candidateMap.values()),
+            immichBase,
+            apiKey: API_KEY,
+            hasTraining: true,
+        });
+
+        const threshold = Number(appSettings.autoArchiveConfidenceThreshold ?? AUTO_ARCHIVE_CONFIDENCE_THRESHOLD);
+        const maxArchiveCount = Number(appSettings.autoArchiveBatchSize ?? AUTO_ARCHIVE_ARCHIVE_BATCH_SIZE);
+        const badAssetIds = scoredAssets
+            .filter(item => item.score <= threshold)
+            .sort((left, right) => left.score - right.score)
+            .slice(0, maxArchiveCount)
+            .map(item => item.asset.id);
 
         if (badAssetIds.length > 0) {
             if (dryRun) {
                 console.log(`[Cron] Dry run selected ${badAssetIds.length} bad assets.`);
             } else {
-                console.log(`[Cron] Archiving ${badAssetIds.length} bad assets.`);
-                await fetch(`${immichBase}/api/assets`, {
-                    method: 'PUT',
-                    headers: { ...headers, 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ids: badAssetIds, isArchived: true }),
+                console.log(`[Cron] Archiving ${badAssetIds.length} bad assets in batches.`);
+                const verifiedArchivedIds = await archiveAssetsWithVerification({
+                    immichBase,
+                    headers,
+                    apiKey: API_KEY,
+                    assetIds: badAssetIds,
                 });
+                console.log(`[Cron] Verified ${verifiedArchivedIds.length} archived assets.`);
+                return {
+                    skipped: false,
+                    archivedCount: verifiedArchivedIds.length,
+                    archivedIds: verifiedArchivedIds,
+                    threshold,
+                    scannedCount: candidateMap.size,
+                };
             }
-            return { skipped: false, archivedCount: badAssetIds.length, archivedIds: badAssetIds };
+            return {
+                skipped: false,
+                archivedCount: badAssetIds.length,
+                archivedIds: badAssetIds,
+                threshold,
+                scannedCount: candidateMap.size,
+            };
         } else {
             console.log('[Cron] No bad assets found this cycle.');
-            return { skipped: false, archivedCount: 0, archivedIds: [] };
+            return { skipped: false, archivedCount: 0, archivedIds: [], threshold, scannedCount: candidateMap.size };
         }
     } catch (e) {
         console.error('[Cron] Error:', e.message);
