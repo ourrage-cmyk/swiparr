@@ -62,9 +62,10 @@ export const useAiStore = defineStore('aiStore', () => {
     /**
      * Fetch 250 scored assets from the backend triage endpoint.
      */
-    async function fetchTriageBatch(count: number = 60) {
+    async function fetchTriageBatch(count?: number) {
         const { immichUrl, apiKey } = getImmichCredentials();
-        const resp = await fetch(`${getBackendUrl()}/api/triage?count=${count}`, {
+        const query = typeof count === 'number' ? `?count=${count}` : '';
+        const resp = await fetch(`${getBackendUrl()}/api/triage${query}`, {
             headers: {
                 'x-target-host': immichUrl,
                 'x-api-key': apiKey,
@@ -80,5 +81,29 @@ export const useAiStore = defineStore('aiStore', () => {
         return await resp.json();
     }
 
-    return { trainOnAsset, trainOnBatch, fetchTriageBatch, fetchStats };
+    async function fetchSettings() {
+        const resp = await fetch(getBackendUrl() + '/api/settings');
+        if (!resp.ok) throw new Error('Failed to fetch app settings.');
+        return await resp.json();
+    }
+
+    async function saveSettings(settings: Record<string, unknown>) {
+        const resp = await fetch(getBackendUrl() + '/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(settings),
+        });
+        if (!resp.ok) throw new Error('Failed to save app settings.');
+        return await resp.json();
+    }
+
+    async function runAutoArchive(dryRun: boolean = false) {
+        const resp = await fetch(`${getBackendUrl()}/api/auto-archive/run${dryRun ? '?dryRun=true' : ''}`, {
+            method: 'POST',
+        });
+        if (!resp.ok) throw new Error('Failed to run auto-archive.');
+        return await resp.json();
+    }
+
+    return { trainOnAsset, trainOnBatch, fetchTriageBatch, fetchStats, fetchSettings, saveSettings, runAutoArchive };
 });

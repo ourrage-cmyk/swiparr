@@ -2,6 +2,7 @@
 import { useUiStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
 import { useRouter } from 'vue-router'
+import { useRoute } from 'vue-router'
 import { usePreferencesStore } from '@/stores/preferences'
 import { useReviewedStore } from '@/stores/reviewed'
 import { ref } from 'vue'
@@ -11,6 +12,7 @@ const authStore = useAuthStore()
 const preferencesStore = usePreferencesStore()
 const reviewedStore = useReviewedStore()
 const router = useRouter()
+const route = useRoute()
 const showResetModal = ref(false)
 
 function logout() {
@@ -200,6 +202,22 @@ function confirmResetReviewed() {
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16" />
         </svg>
         <span class="hidden sm:inline">Bulk Triage</span>
+      </button>
+
+      <button
+        @click="router.push('/settings')"
+        class="flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium border transition-colors"
+        :class="route.path === '/settings'
+          ? 'bg-amber-600 border-amber-500 text-white hover:bg-amber-700'
+          : uiStore.isDarkMode
+            ? 'border-gray-700 text-gray-300 hover:bg-gray-800'
+            : 'border-gray-300 text-gray-600 hover:bg-gray-100'"
+      >
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317a1 1 0 011.35-.936l1.49.596a1 1 0 00.77 0l1.49-.596a1 1 0 011.35.936l.19 1.597a1 1 0 00.524.768l1.362.766a1 1 0 01.363 1.457l-.88 1.345a1 1 0 000 .87l.88 1.345a1 1 0 01-.363 1.457l-1.362.766a1 1 0 00-.524.768l-.19 1.597a1 1 0 01-1.35.936l-1.49-.596a1 1 0 00-.77 0l-1.49.596a1 1 0 01-1.35-.936l-.19-1.597a1 1 0 00-.524-.768l-1.362-.766a1 1 0 01-.363-1.457l.88-1.345a1 1 0 000-.87l-.88-1.345a1 1 0 01.363-1.457l1.362-.766a1 1 0 00.524-.768l.19-1.597z" />
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+        </svg>
+        <span class="hidden sm:inline">Settings</span>
       </button>
 
       <!-- Logout / Switch User -->

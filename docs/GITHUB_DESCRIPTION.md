@@ -16,7 +16,7 @@ Immich Swipe is a Vue + Node app for reviewing Immich photos Tinder-style. Manua
 - Toggleable cron auto-archive
 - User-set certainty threshold in the web UI
 - Manual training only; automation never retrains the model
-- Docker image available at `goethenorris/swiparr:v2`
+- Docker image available at `goethenorris/swiparr:v3`
 
 ## Suggested GitHub topics
 

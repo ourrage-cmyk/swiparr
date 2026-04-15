@@ -12,6 +12,7 @@ const authStore = useAuthStore()
 const loading = ref(true)
 const items = ref<any[]>([])
 const stats = ref({ total: 0, good: 0, bad: 0 })
+const triageBatchSize = ref(60)
 
 function getThumbnailUrl(assetId: string) {
     const params = new URLSearchParams({
@@ -24,12 +25,14 @@ function getThumbnailUrl(assetId: string) {
 
 async function loadTriage() {
     loading.value = true;
-    const [batch, trainingStats] = await Promise.all([
+    const [batch, trainingStats, settings] = await Promise.all([
         aiStore.fetchTriageBatch(),
         aiStore.fetchStats(),
+        aiStore.fetchSettings(),
     ]);
     items.value = batch;
     stats.value = trainingStats;
+    triageBatchSize.value = Number(settings.triageBatchSize ?? 60);
     // By default, mark items as "delete" (checked) if score is < 0.3
     items.value.forEach(i => i.selected = (i.score < 0.3));
     loading.value = false;
@@ -54,6 +57,7 @@ onMounted(() => {
         <h1 class="text-2xl font-bold mb-4">Triage Grid</h1>
         <p class="mb-4 text-sm text-gray-500">Uncheck photos you want to KEEP. Photos that remain checked will be marked as bad.</p>
         <p class="mb-4 text-sm text-gray-500">Training set: {{ stats.total }} vectors, {{ stats.good }} keep, {{ stats.bad }} archive.</p>
+        <p class="mb-4 text-sm text-gray-500">Current triage batch size: {{ triageBatchSize }} images.</p>
         
         <div v-if="loading" class="flex flex-col items-center justify-center p-12">
             <div class="w-full max-w-md bg-gray-200 rounded-full h-2.5 mb-4 dark:bg-gray-700 overflow-hidden">

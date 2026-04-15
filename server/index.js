@@ -111,15 +111,24 @@ const qdrant = new QdrantClient({ host: process.env.QDRANT_HOST || 'qdrant', por
 const COLLECTION_NAME = 'immich_swipe_vectors';
 let qdrantReady = false;
 let qdrantInitPromise = null;
+let autoArchiveTask = null;
 const TRIAGE_BATCH_DEFAULT = 60;
+const TRIAGE_BATCH_MIN = 12;
 const TRIAGE_BATCH_MAX = 250;
 const TRIAGE_CONCURRENCY = 4;
 const MIN_TRAINING_POINTS = 5;
 const AUTO_ARCHIVE_MIN_POINTS = MIN_TRAINING_POINTS;
 const MANUAL_SOURCE = 'manual';
+const AUTO_ARCHIVE_CRON_DEFAULT = '0 * * * *';
 const AUTO_ARCHIVE_SCAN_BATCH_SIZE = 40;
+const AUTO_ARCHIVE_SCAN_BATCH_MIN = 10;
+const AUTO_ARCHIVE_SCAN_BATCH_MAX = 250;
 const AUTO_ARCHIVE_BATCHES_PER_RUN = 3;
+const AUTO_ARCHIVE_SCAN_BATCHES_MIN = 1;
+const AUTO_ARCHIVE_SCAN_BATCHES_MAX = 10;
 const AUTO_ARCHIVE_ARCHIVE_BATCH_SIZE = 25;
+const AUTO_ARCHIVE_ARCHIVE_BATCH_MIN = 1;
+const AUTO_ARCHIVE_ARCHIVE_BATCH_MAX = 100;
 const AUTO_ARCHIVE_CONFIDENCE_THRESHOLD = 0.2;
 
 async function ensureQdrantReady() {
@@ -271,6 +280,34 @@ function chunkItems(items, chunkSize) {
     return chunks;
 }
 
+function clampInteger(value, min, max, fallback) {
+    const parsed = Number.parseInt(String(value), 10);
+    if (Number.isNaN(parsed)) return fallback;
+    return Math.min(Math.max(parsed, min), max);
+}
+
+function clampNumber(value, min, max, fallback) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(Math.max(parsed, min), max);
+}
+
+function sanitizeSettings(raw = {}) {
+    const cronExpression = typeof raw.autoArchiveCronExpression === 'string'
+        ? raw.autoArchiveCronExpression.trim()
+        : AUTO_ARCHIVE_CRON_DEFAULT;
+
+    return {
+        autoArchive: Boolean(raw.autoArchive),
+        autoArchiveConfidenceThreshold: clampNumber(raw.autoArchiveConfidenceThreshold, 0, 1, AUTO_ARCHIVE_CONFIDENCE_THRESHOLD),
+        autoArchiveBatchSize: clampInteger(raw.autoArchiveBatchSize, AUTO_ARCHIVE_ARCHIVE_BATCH_MIN, AUTO_ARCHIVE_ARCHIVE_BATCH_MAX, AUTO_ARCHIVE_ARCHIVE_BATCH_SIZE),
+        autoArchiveScanBatchSize: clampInteger(raw.autoArchiveScanBatchSize, AUTO_ARCHIVE_SCAN_BATCH_MIN, AUTO_ARCHIVE_SCAN_BATCH_MAX, AUTO_ARCHIVE_SCAN_BATCH_SIZE),
+        autoArchiveScanBatchesPerRun: clampInteger(raw.autoArchiveScanBatchesPerRun, AUTO_ARCHIVE_SCAN_BATCHES_MIN, AUTO_ARCHIVE_SCAN_BATCHES_MAX, AUTO_ARCHIVE_BATCHES_PER_RUN),
+        autoArchiveCronExpression: cron.validate(cronExpression) ? cronExpression : AUTO_ARCHIVE_CRON_DEFAULT,
+        triageBatchSize: clampInteger(raw.triageBatchSize, TRIAGE_BATCH_MIN, TRIAGE_BATCH_MAX, TRIAGE_BATCH_DEFAULT),
+    };
+}
+
 async function fetchAssetDetails(immichBase, apiKey, assetId) {
     const response = await fetch(`${immichBase}/api/assets/${assetId}`, {
         headers: {
@@ -299,10 +336,10 @@ async function archiveAssetBatch(immichBase, headers, assetIds) {
     }
 }
 
-async function archiveAssetsWithVerification({ immichBase, headers, apiKey, assetIds }) {
+async function archiveAssetsWithVerification({ immichBase, headers, apiKey, assetIds, chunkSize }) {
     const verifiedArchivedIds = [];
 
-    for (const batchIds of chunkItems(assetIds, AUTO_ARCHIVE_ARCHIVE_BATCH_SIZE)) {
+    for (const batchIds of chunkItems(assetIds, chunkSize)) {
         await archiveAssetBatch(immichBase, headers, batchIds);
 
         for (const assetId of batchIds) {
@@ -382,7 +419,7 @@ app.get('/api/triage', async (req, res) => {
     try {
         const immichUrl = req.headers['x-target-host'];
         const apiKey = req.headers['x-api-key'];
-        const requestedCount = Number.parseInt(String(req.query.count || TRIAGE_BATCH_DEFAULT), 10);
+        const requestedCount = Number.parseInt(String(req.query.count ?? appSettings.triageBatchSize ?? TRIAGE_BATCH_DEFAULT), 10);
         const batchSize = Math.min(Math.max(Number.isNaN(requestedCount) ? TRIAGE_BATCH_DEFAULT : requestedCount, 1), TRIAGE_BATCH_MAX);
         if (!immichUrl || !apiKey) {
             return res.status(400).json({ error: 'Missing x-target-host or x-api-key headers' });
@@ -445,18 +482,33 @@ app.get('/api/stats', async (_req, res) => {
 
 // ---- Settings persistence ----
 const SETTINGS_FILE = path.join(APP_DATA_DIR, 'settings.json');
-let appSettings = {
-    autoArchive: false,
-    autoArchiveConfidenceThreshold: AUTO_ARCHIVE_CONFIDENCE_THRESHOLD,
-    autoArchiveBatchSize: AUTO_ARCHIVE_ARCHIVE_BATCH_SIZE,
-};
+let appSettings = sanitizeSettings();
 
 fs.mkdirSync(APP_DATA_DIR, { recursive: true });
+
+function scheduleAutoArchiveTask() {
+    if (autoArchiveTask) {
+        autoArchiveTask.stop();
+        if (typeof autoArchiveTask.destroy === 'function') {
+            autoArchiveTask.destroy();
+        }
+    }
+
+    autoArchiveTask = cron.schedule(appSettings.autoArchiveCronExpression, async () => {
+        try {
+            await runAutoArchive();
+        } catch (e) {
+            console.error('[Cron] Scheduled run failed:', e.message);
+        }
+    });
+
+    console.log(`[Cron] Scheduled auto-archive with '${appSettings.autoArchiveCronExpression}'.`);
+}
 
 function loadSettings() {
     try {
         if (fs.existsSync(SETTINGS_FILE)) {
-            appSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
+            appSettings = sanitizeSettings(JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8')));
             console.log('[Settings] Loaded:', appSettings);
         }
     } catch (e) {
@@ -464,15 +516,17 @@ function loadSettings() {
     }
 }
 loadSettings();
+scheduleAutoArchiveTask();
 
 app.get('/api/settings', (req, res) => {
     res.json(appSettings);
 });
 
 app.post('/api/settings', (req, res) => {
-    appSettings = { ...appSettings, ...req.body };
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(appSettings));
-    res.json({ success: true });
+    appSettings = sanitizeSettings({ ...appSettings, ...req.body });
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(appSettings, null, 2));
+    scheduleAutoArchiveTask();
+    res.json({ success: true, settings: appSettings });
 });
 
 // SPA fallback — must be AFTER api routes
@@ -518,8 +572,10 @@ async function runAutoArchive(options = {}) {
         const headers = { 'x-api-key': API_KEY, 'Accept': 'application/json' };
 
         const candidateMap = new Map();
-        for (let batchIndex = 0; batchIndex < AUTO_ARCHIVE_BATCHES_PER_RUN; batchIndex += 1) {
-            const randResp = await fetch(`${immichBase}/api/assets/random?count=${AUTO_ARCHIVE_SCAN_BATCH_SIZE}`, { headers });
+        const scanBatchSize = Number(appSettings.autoArchiveScanBatchSize ?? AUTO_ARCHIVE_SCAN_BATCH_SIZE);
+        const scanBatchesPerRun = Number(appSettings.autoArchiveScanBatchesPerRun ?? AUTO_ARCHIVE_BATCHES_PER_RUN);
+        for (let batchIndex = 0; batchIndex < scanBatchesPerRun; batchIndex += 1) {
+            const randResp = await fetch(`${immichBase}/api/assets/random?count=${scanBatchSize}`, { headers });
             if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
             const assets = await randResp.json();
             for (const asset of assets) {
@@ -554,6 +610,7 @@ async function runAutoArchive(options = {}) {
                     headers,
                     apiKey: API_KEY,
                     assetIds: badAssetIds,
+                    chunkSize: maxArchiveCount,
                 });
                 console.log(`[Cron] Verified ${verifiedArchivedIds.length} archived assets.`);
                 return {
@@ -590,9 +647,6 @@ app.post('/api/auto-archive/run', async (req, res) => {
         res.status(500).json({ error: e.message });
     }
 });
-
-// Run hourly
-cron.schedule('0 * * * *', runAutoArchive);
 
 // ---- Boot ----
 const PORT = process.env.PORT || 80;

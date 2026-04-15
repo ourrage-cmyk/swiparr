@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useImmich } from '@/composables/useImmich'
 import { useUiStore } from '@/stores/ui'
 import { usePreferencesStore } from '@/stores/preferences'
@@ -33,12 +33,6 @@ const isLoadingAlbums = ref(false)
 const albumsError = ref<string | null>(null)
 const albums = ref<ImmichAlbum[]>([])
 
-const autoArchiveEnabled = ref(false)
-const autoArchiveThreshold = ref(0.2)
-const trainingStats = ref({ total: 0, good: 0, bad: 0 })
-const minimumTrainingPoints = 5
-const thresholdLabel = computed(() => autoArchiveThreshold.value.toFixed(2))
-
 function queueTrainingDecision(isGood: boolean) {
   const assetId = currentAsset.value?.id ?? null
   void aiStore.trainOnAsset(assetId, isGood)
@@ -53,65 +47,6 @@ async function handleArchive() {
   queueTrainingDecision(false)
   await archivePhoto()
 }
-
-async function saveAutoArchiveSettings(successMessage?: string) {
-  try {
-    const response = await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        autoArchive: autoArchiveEnabled.value,
-        autoArchiveConfidenceThreshold: autoArchiveThreshold.value,
-      }),
-    })
-
-    if (!response.ok) {
-      throw new Error('Failed to save settings')
-    }
-
-    if (successMessage) {
-      uiStore.toast(successMessage, 'success', 2200)
-    }
-  } catch (e) {
-    console.error('Failed to save settings', e)
-    uiStore.toast('Failed to update auto-archive settings.', 'error')
-  }
-}
-
-async function toggleAutoArchive() {
-  await saveAutoArchiveSettings(
-    autoArchiveEnabled.value
-      ? 'Auto-archive enabled. Hourly cron will use your threshold once enough manual training exists.'
-      : 'Auto-archive disabled.',
-  )
-}
-
-async function updateAutoArchiveThreshold() {
-  await saveAutoArchiveSettings(`Auto-archive threshold set to ${thresholdLabel.value}.`)
-}
-
-async function loadTrainingStats() {
-  try {
-    trainingStats.value = await aiStore.fetchStats()
-  } catch (e) {
-    console.error('Failed to load training stats', e)
-  }
-}
-
-onMounted(async () => {
-  try {
-    const resp = await fetch('/api/settings')
-    if (resp.ok) {
-      const settings = await resp.json()
-      autoArchiveEnabled.value = Boolean(settings.autoArchive)
-      autoArchiveThreshold.value = Number(settings.autoArchiveConfidenceThreshold ?? 0.2)
-    }
-  } catch (e) {
-    console.error('Failed to load auto-archive settings', e)
-  }
-
-  await loadTrainingStats()
-})
 
 // Keyboard navigation
 function handleKeydown(e: KeyboardEvent) {
@@ -285,43 +220,15 @@ onUnmounted(() => {
           >
               Automatic Cleanup
           </button>
-          <div class="mt-4 flex items-center gap-2">
-              <input type="checkbox" v-model="autoArchiveEnabled" @change="toggleAutoArchive" id="autoArchive" class="w-4 h-4" />
-              <label for="autoArchive" class="text-sm">Enable Server-Side Auto-Archive (Cron)</label>
-          </div>
-          <div class="w-full max-w-md rounded-xl border px-4 py-3"
-            :class="uiStore.isDarkMode ? 'border-gray-800 bg-gray-950/60' : 'border-gray-200 bg-gray-50'"
+          <button 
+              @click="router.push('/settings')"
+              class="px-4 py-2 rounded-lg border transition-colors"
+              :class="uiStore.isDarkMode
+                ? 'border-gray-700 text-gray-200 hover:bg-gray-900'
+                : 'border-gray-300 text-gray-700 hover:bg-gray-100'"
           >
-            <div class="flex items-center justify-between gap-4">
-              <label for="autoArchiveThreshold" class="text-sm font-medium">
-                Auto-archive threshold
-              </label>
-              <span class="text-sm font-mono">{{ thresholdLabel }}</span>
-            </div>
-            <input
-              id="autoArchiveThreshold"
-              v-model.number="autoArchiveThreshold"
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              class="mt-3 w-full"
-              @change="updateAutoArchiveThreshold"
-            />
-            <div class="mt-2 flex justify-between text-xs"
-              :class="uiStore.isDarkMode ? 'text-gray-500' : 'text-gray-500'"
-            >
-              <span>More aggressive</span>
-              <span>More conservative</span>
-            </div>
-            <p class="mt-3 text-xs"
-              :class="uiStore.isDarkMode ? 'text-gray-400' : 'text-gray-600'"
-            >
-              Manual training vectors: {{ trainingStats.total }}
-              ({{ trainingStats.good }} keep, {{ trainingStats.bad }} archive).
-              The threshold starts mattering after at least {{ minimumTrainingPoints }} manual decisions.
-            </p>
-          </div>
+              Review Settings
+          </button>
 
           <!-- Instructions (now mobile -> hidden) -->
           <div class="hidden sm:flex text-center text-sm py-2 items-center flex-col gap-y-2"
