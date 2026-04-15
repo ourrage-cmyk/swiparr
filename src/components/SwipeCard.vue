@@ -29,8 +29,7 @@ const videoRef = ref<HTMLVideoElement | null>(null)
 const videoAbortController = ref<AbortController | null>(null)
 let autoplayCleanup: (() => void) | null = null
 const assetApiBaseUrl = computed(() => {
-  if (!authStore.immichBaseUrl) return ''
-  return `${authStore.immichBaseUrl}${authStore.proxyBaseUrl}`
+  return authStore.proxyBaseUrl
 })
 const assetPageUrl = computed(() => {
   if (!authStore.immichBaseUrl) return ''
