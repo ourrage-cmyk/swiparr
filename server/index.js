@@ -130,6 +130,7 @@ const AUTO_ARCHIVE_ARCHIVE_BATCH_SIZE = 25;
 const AUTO_ARCHIVE_ARCHIVE_BATCH_MIN = 1;
 const AUTO_ARCHIVE_ARCHIVE_BATCH_MAX = 100;
 const AUTO_ARCHIVE_CONFIDENCE_THRESHOLD = 0.2;
+const ARCHIVED_ALBUM_NAME = 'archived';
 
 async function ensureQdrantReady() {
     if (qdrantReady) {
@@ -333,6 +334,54 @@ async function archiveAssetBatch(immichBase, headers, assetIds) {
     if (!response.ok) {
         const errorText = await response.text().catch(() => '');
         throw new Error(`Immich archive request failed (${response.status}): ${errorText}`);
+    }
+}
+
+async function ensureArchivedAlbum(immichBase, apiKey) {
+    const headers = {
+        'x-api-key': apiKey,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+    };
+
+    const response = await fetch(`${immichBase}/api/albums`, { headers });
+    if (!response.ok) {
+        throw new Error(`Immich album lookup failed: ${response.status}`);
+    }
+
+    const albums = await response.json();
+    const existingAlbum = albums.find((album) => String(album.albumName || '').toLowerCase() === ARCHIVED_ALBUM_NAME);
+    if (existingAlbum) {
+        return existingAlbum;
+    }
+
+    const createResponse = await fetch(`${immichBase}/api/albums`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ albumName: ARCHIVED_ALBUM_NAME }),
+    });
+
+    if (!createResponse.ok) {
+        throw new Error(`Immich album creation failed: ${createResponse.status}`);
+    }
+
+    return createResponse.json();
+}
+
+async function addAssetsToAlbum(immichBase, apiKey, albumId, assetIds) {
+    const response = await fetch(`${immichBase}/api/albums/${albumId}/assets`, {
+        method: 'PUT',
+        headers: {
+            'x-api-key': apiKey,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ids: assetIds }),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`Immich add-to-album failed (${response.status}): ${errorText}`);
     }
 }
 
@@ -612,6 +661,10 @@ async function runAutoArchive(options = {}) {
                     assetIds: badAssetIds,
                     chunkSize: maxArchiveCount,
                 });
+                if (verifiedArchivedIds.length > 0) {
+                    const archivedAlbum = await ensureArchivedAlbum(immichBase, API_KEY);
+                    await addAssetsToAlbum(immichBase, API_KEY, archivedAlbum.id, verifiedArchivedIds);
+                }
                 console.log(`[Cron] Verified ${verifiedArchivedIds.length} archived assets.`);
                 return {
                     skipped: false,

@@ -9,7 +9,7 @@ services:
       - qdrant_storage:/qdrant/storage
 
   immich-swipe:
-    image: goethenorris/swiparr:v3
+    image: goethenorris/swiparr:v4
     container_name: immich-swipe
     restart: unless-stopped
     depends_on:

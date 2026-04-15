@@ -220,6 +220,21 @@ function confirmResetReviewed() {
         <span class="hidden sm:inline">Settings</span>
       </button>
 
+      <button
+        @click="router.push('/archived')"
+        class="flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium border transition-colors"
+        :class="route.path === '/archived'
+          ? 'bg-emerald-600 border-emerald-500 text-white hover:bg-emerald-700'
+          : uiStore.isDarkMode
+            ? 'border-gray-700 text-gray-300 hover:bg-gray-800'
+            : 'border-gray-300 text-gray-600 hover:bg-gray-100'"
+      >
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 8l2 11a2 2 0 002 1h6a2 2 0 002-1l2-11M9 8V6a3 3 0 016 0v2M4 8h16" />
+        </svg>
+        <span class="hidden sm:inline">Archived</span>
+      </button>
+
       <!-- Logout / Switch User -->
       <button
         @click="logout"

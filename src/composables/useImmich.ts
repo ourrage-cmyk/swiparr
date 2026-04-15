@@ -27,6 +27,7 @@ export function useImmich() {
   const RANDOM_MAX_ATTEMPTS = 20
 
   const albumsCache = ref<ImmichAlbum[] | null>(null)
+  const ARCHIVED_ALBUM_NAME = 'archived'
 
   const chronologicalQueue = ref<ImmichAsset[]>([])
   const chronologicalSkip = ref(0)
@@ -442,6 +443,43 @@ export function useImmich() {
     return albums
   }
 
+  async function getOrCreateArchivedAlbum(): Promise<ImmichAlbum> {
+    const albums = await fetchAlbums()
+    const existingAlbum = albums.find((album) => album.albumName.toLowerCase() === ARCHIVED_ALBUM_NAME)
+    if (existingAlbum) {
+      return existingAlbum
+    }
+
+    return createAlbum(ARCHIVED_ALBUM_NAME)
+  }
+
+  async function addAssetToArchivedAlbum(assetId: string): Promise<void> {
+    const album = await getOrCreateArchivedAlbum()
+    await addAssetToAlbum(album.id, assetId)
+  }
+
+  async function fetchAlbumAssets(albumId: string): Promise<ImmichAsset[]> {
+    const album = await apiRequest<Record<string, unknown>>(`/albums/${albumId}`)
+    const rawAssets = Array.isArray(album.assets)
+      ? album.assets
+      : Array.isArray(album.albumAssets)
+        ? album.albumAssets
+        : []
+
+    return rawAssets as ImmichAsset[]
+  }
+
+  async function fetchArchivedAssets(): Promise<ImmichAsset[]> {
+    const albums = await fetchAlbums()
+    const archivedAlbum = albums.find((album) => album.albumName.toLowerCase() === ARCHIVED_ALBUM_NAME)
+    if (!archivedAlbum) {
+      return []
+    }
+
+    const assets = await fetchAlbumAssets(archivedAlbum.id)
+    return assets.filter((asset) => asset.isArchived)
+  }
+
   async function addAssetToAlbum(albumId: string, assetId: string): Promise<void> {
     await apiRequest(`/albums/${albumId}/assets`, {
       method: 'PUT',
@@ -559,6 +597,11 @@ export function useImmich() {
     const success = await archiveAsset(assetToArchive.id, true)
 
     if (success) {
+      try {
+        await addAssetToArchivedAlbum(assetToArchive.id)
+      } catch (e) {
+        console.error('Failed to add asset to archived album:', e)
+      }
       actionHistory.value.push({ asset: assetToArchive, type: 'delete' }) // Keep 'delete' type for internal history/stats simplicity
       reviewedStore.markReviewed(assetToArchive.id, 'delete')
       uiStore.incrementDeleted()
@@ -630,8 +673,10 @@ export function useImmich() {
     getAssetOriginalUrl,
     getAuthHeaders,
     fetchAlbums,
+    fetchArchivedAssets,
     createAlbum,
     addAssetToAlbum,
+    addAssetToArchivedAlbum,
     archiveAsset,
   }
 }

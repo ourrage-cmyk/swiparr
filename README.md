@@ -35,6 +35,8 @@ Swipe-review your Immich library: right = keep, left = archive. It adds manual t
 - Toggleable server-side cron auto-archive
 - User-controlled auto-archive threshold in the web UI
 - Auto-archive never writes its own decisions back into training
+- Archived assets are added to an Immich album named `archived` for later review
+- Archived review page with restore and direct-open-in-Immich actions
 
 ## How It Works
 
@@ -132,7 +134,7 @@ services:
       - /mnt/SSDCAGE/swiparr/qdrant:/qdrant/storage
 
   immich-swipe:
-    image: goethenorris/swiparr:v3
+    image: goethenorris/swiparr:v4
     container_name: immich-swipe
     restart: unless-stopped
     depends_on:
