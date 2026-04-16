@@ -119,6 +119,9 @@ const TRIAGE_CONCURRENCY = 4;
 const MIN_TRAINING_POINTS = 5;
 const SCORE_SEARCH_LIMIT = 128;
 const SCORE_NEIGHBOR_COUNT = 24;
+const SCORE_CLIP_WEIGHT = 0.72;
+const SCORE_QUALITY_WEIGHT = 0.28;
+const QUALITY_SAMPLE_TARGET = 256;
 const REVIEW_CANDIDATE_TARGET_DEFAULT = 12;
 const REVIEW_CANDIDATE_TARGET_MIN = 4;
 const REVIEW_CANDIDATE_TARGET_MAX = 40;
@@ -208,24 +211,183 @@ async function initModel() {
     return extractor;
 }
 
+function clamp01(value) {
+    return Math.min(Math.max(value, 0), 1);
+}
+
+function normalizeRange(value, min, max) {
+    if (value <= min) return 0;
+    if (value >= max) return 1;
+    return (value - min) / (max - min);
+}
+
 /**
- * Download an image from Immich, convert to a RawImage, then run CLIP.
- * Returns a 512-dim Float32 array.
+ * Download an image from Immich and convert it to a RawImage.
  */
-async function extractEmbeddingFromUrl(imageUrl, apiKey) {
+async function fetchAnalysisImage(imageUrl, apiKey) {
     const resp = await fetch(imageUrl, {
         headers: { 'x-api-key': apiKey, 'Accept': 'application/octet-stream' },
     });
     if (!resp.ok) throw new Error(`Fetch failed ${resp.status} for ${imageUrl}`);
     const buffer = Buffer.from(await resp.arrayBuffer());
 
-    // RawImage.fromBlob works with a Blob; in Node we create one from the buffer
     const blob = new Blob([buffer], { type: resp.headers.get('content-type') || 'image/jpeg' });
     const image = await RawImage.fromBlob(blob);
 
+    return image.rgba();
+}
+
+/**
+ * Run CLIP on a decoded RawImage.
+ * Returns a 512-dim Float32 array.
+ */
+async function extractEmbeddingFromImage(image) {
     const ext = await initModel();
     const output = await ext(image, { pooling: 'mean', normalize: true });
     return Array.from(output.data);
+}
+
+function analyzeImageQuality(image, asset = null) {
+    const width = Number(image?.width || 0);
+    const height = Number(image?.height || 0);
+    const data = image?.data;
+    if (!width || !height || !data?.length) {
+        return {
+            overall: 0.5,
+            blur: 0.5,
+            exposure: 0.5,
+            noise: 0.5,
+            screenshot: 1,
+            meanLuma: 0.5,
+            darkClip: 0,
+            brightClip: 0,
+            edgeDensity: 0,
+            lowSaturation: 0,
+            laplacianVariance: 0,
+            noiseResidual: 0,
+            reasons: [],
+        };
+    }
+
+    const sampleStep = Math.max(1, Math.ceil(Math.max(width, height) / QUALITY_SAMPLE_TARGET));
+    const sampledWidth = Math.ceil(width / sampleStep);
+    const sampledHeight = Math.ceil(height / sampleStep);
+    const luma = new Float32Array(sampledWidth * sampledHeight);
+    let lumaSum = 0;
+    let darkClipCount = 0;
+    let brightClipCount = 0;
+    let lowSaturationCount = 0;
+
+    for (let sampleY = 0; sampleY < sampledHeight; sampleY += 1) {
+        const y = Math.min(height - 1, sampleY * sampleStep);
+        for (let sampleX = 0; sampleX < sampledWidth; sampleX += 1) {
+            const x = Math.min(width - 1, sampleX * sampleStep);
+            const pixelOffset = (y * width + x) * 4;
+            const red = data[pixelOffset] / 255;
+            const green = data[pixelOffset + 1] / 255;
+            const blue = data[pixelOffset + 2] / 255;
+            const maxChannel = Math.max(red, green, blue);
+            const minChannel = Math.min(red, green, blue);
+            const saturation = maxChannel === 0 ? 0 : (maxChannel - minChannel) / maxChannel;
+            const luminance = (0.2126 * red) + (0.7152 * green) + (0.0722 * blue);
+            const sampleIndex = (sampleY * sampledWidth) + sampleX;
+            luma[sampleIndex] = luminance;
+            lumaSum += luminance;
+            if (luminance < 0.08) darkClipCount += 1;
+            if (luminance > 0.92) brightClipCount += 1;
+            if (saturation < 0.12) lowSaturationCount += 1;
+        }
+    }
+
+    const totalSamples = luma.length;
+    const meanLuma = totalSamples > 0 ? lumaSum / totalSamples : 0.5;
+    const darkClip = totalSamples > 0 ? darkClipCount / totalSamples : 0;
+    const brightClip = totalSamples > 0 ? brightClipCount / totalSamples : 0;
+    const lowSaturation = totalSamples > 0 ? lowSaturationCount / totalSamples : 0;
+
+    let laplacianSum = 0;
+    let laplacianSumSq = 0;
+    let edgeCount = 0;
+    let interiorCount = 0;
+    let noiseResidualSum = 0;
+    let noiseResidualCount = 0;
+
+    for (let sampleY = 1; sampleY < sampledHeight - 1; sampleY += 1) {
+        for (let sampleX = 1; sampleX < sampledWidth - 1; sampleX += 1) {
+            const index = (sampleY * sampledWidth) + sampleX;
+            const center = luma[index];
+            const up = luma[index - sampledWidth];
+            const down = luma[index + sampledWidth];
+            const left = luma[index - 1];
+            const right = luma[index + 1];
+            const laplacian = up + down + left + right - (4 * center);
+            laplacianSum += laplacian;
+            laplacianSumSq += laplacian * laplacian;
+            interiorCount += 1;
+
+            const gradient = Math.abs(right - left) + Math.abs(down - up);
+            if (gradient > 0.16) {
+                edgeCount += 1;
+            }
+
+            if (gradient < 0.12) {
+                noiseResidualSum += Math.abs(center - ((up + down + left + right) * 0.25));
+                noiseResidualCount += 1;
+            }
+        }
+    }
+
+    const laplacianMean = interiorCount > 0 ? laplacianSum / interiorCount : 0;
+    const laplacianVariance = interiorCount > 0
+        ? Math.max(0, (laplacianSumSq / interiorCount) - (laplacianMean * laplacianMean))
+        : 0;
+    const edgeDensity = interiorCount > 0 ? edgeCount / interiorCount : 0;
+    const noiseResidual = noiseResidualCount > 0 ? noiseResidualSum / noiseResidualCount : 0;
+
+    const blur = clamp01(normalizeRange(laplacianVariance, 0.0015, 0.018));
+    const exposurePenalty = Math.max(
+        normalizeRange(Math.abs(meanLuma - 0.5), 0.12, 0.32),
+        normalizeRange(darkClip, 0.18, 0.55),
+        normalizeRange(brightClip, 0.18, 0.55),
+    );
+    const exposure = 1 - clamp01(exposurePenalty);
+    const noise = 1 - clamp01(normalizeRange(noiseResidual, 0.035, 0.11));
+
+    const filename = String(asset?.originalFileName || '');
+    const screenshotByName = /(screenshot|screen[ _-]?shot|schirmfoto|capture d[' ]ecran|截屏|スクリーンショット)/i.test(filename);
+    const screenshotByVisuals = clamp01(normalizeRange(edgeDensity, 0.16, 0.34))
+        * clamp01(normalizeRange(lowSaturation, 0.48, 0.85));
+    const screenshotLikelihood = screenshotByName ? 0.98 : screenshotByVisuals;
+    const screenshot = 1 - clamp01(screenshotLikelihood);
+
+    const reasons = [];
+    if (blur < 0.38) reasons.push('blur');
+    if (exposure < 0.38) reasons.push(darkClip >= brightClip ? 'underexposed' : 'overexposed');
+    if (noise < 0.38) reasons.push('grainy');
+    if (screenshotLikelihood > 0.7) reasons.push('screenshot');
+
+    const overall = clamp01(
+        (blur * 0.36)
+        + (exposure * 0.28)
+        + (noise * 0.24)
+        + (screenshot * 0.12)
+    );
+
+    return {
+        overall,
+        blur,
+        exposure,
+        noise,
+        screenshot,
+        meanLuma,
+        darkClip,
+        brightClip,
+        edgeDensity,
+        lowSaturation,
+        laplacianVariance,
+        noiseResidual,
+        reasons,
+    };
 }
 
 function scoreFromNeighbors(searchRes) {
@@ -278,6 +440,14 @@ async function getTrainingStats() {
     };
 }
 
+function combineScores({ clipScore, qualityScore, hasTraining }) {
+    if (!hasTraining) {
+        return qualityScore;
+    }
+
+    return clamp01((clipScore * SCORE_CLIP_WEIGHT) + (qualityScore * SCORE_QUALITY_WEIGHT));
+}
+
 async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
     return mapWithConcurrency(
         assets.filter(asset => asset.type === 'IMAGE' && !asset.isArchived && !asset.isTrashed && asset.visibility !== ARCHIVE_VISIBILITY),
@@ -285,21 +455,29 @@ async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
         async (asset) => {
             try {
                 const thumbUrl = `${immichBase}/api/assets/${asset.id}/thumbnail?size=preview`;
-                const embedding = await extractEmbeddingFromUrl(thumbUrl, apiKey);
+                const image = await fetchAnalysisImage(thumbUrl, apiKey);
+                const signals = analyzeImageQuality(image, asset);
+                const qualityScore = signals.overall;
 
-                let score = 0.5;
+                let clipScore = 0.5;
                 if (hasTraining) {
+                    const embedding = await extractEmbeddingFromImage(image);
                     const searchRes = await qdrant.search(COLLECTION_NAME, {
                         vector: embedding,
                         limit: SCORE_SEARCH_LIMIT,
                         with_payload: true,
                     });
-                    score = scoreFromNeighbors(searchRes.filter(isManualTrainingPoint));
+                    clipScore = scoreFromNeighbors(searchRes.filter(isManualTrainingPoint));
                 }
+
+                const score = combineScores({ clipScore, qualityScore, hasTraining });
 
                 return {
                     asset,
                     score,
+                    clipScore,
+                    qualityScore,
+                    signals,
                     imgUrl: thumbUrl,
                 };
             } catch (e) {
@@ -489,7 +667,8 @@ app.post('/api/swipe', async (req, res) => {
 
         const immichBase = immichUrl.endsWith('/') ? immichUrl.slice(0, -1) : immichUrl;
         const thumbUrl = `${immichBase}/api/assets/${assetId}/thumbnail?size=preview`;
-        const embedding = await extractEmbeddingFromUrl(thumbUrl, apiKey);
+        const image = await fetchAnalysisImage(thumbUrl, apiKey);
+        const embedding = await extractEmbeddingFromImage(image);
 
         await qdrant.upsert(COLLECTION_NAME, {
             wait: true,
@@ -525,25 +704,12 @@ app.get('/api/triage', async (req, res) => {
             return res.status(400).json({ error: 'Missing x-target-host or x-api-key headers' });
         }
 
-        if (!await ensureQdrantReady()) {
-            console.warn('[Triage] Qdrant not ready, returning random unscored assets');
-            const immichBase = immichUrl.endsWith('/') ? immichUrl.slice(0, -1) : immichUrl;
-            const headers = { 'x-api-key': apiKey, 'Accept': 'application/json' };
-            const randResp = await fetchRandomTimelineAssets(immichBase, headers, batchSize);
-            if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
-            const assets = await randResp.json();
-            const scoredAssets = assets
-                .filter(a => a.type === 'IMAGE' && !a.isTrashed && a.visibility !== ARCHIVE_VISIBILITY)
-                .map((asset, idx) => ({
-                    asset,
-                    score: 0.5,
-                    imgUrl: `${immichBase}/api/assets/${asset.id}/thumbnail?size=preview`,
-                }));
-            return res.json(scoredAssets);
-        }
-
         const immichBase = immichUrl.endsWith('/') ? immichUrl.slice(0, -1) : immichUrl;
         const headers = { 'x-api-key': apiKey, 'Accept': 'application/json' };
+        const qdrantAvailable = await ensureQdrantReady();
+        if (!qdrantAvailable) {
+            console.warn('[Triage] Qdrant not ready, falling back to heuristic-only scoring');
+        }
 
         // 1. Fetch a bounded random sample from Immich
         const randResp = await fetchRandomTimelineAssets(immichBase, headers, batchSize);
@@ -552,10 +718,12 @@ app.get('/api/triage', async (req, res) => {
 
         // 2. Check how much training data we have
         let hasTraining = false;
-        try {
-            const trainingStats = await getTrainingStats();
-            hasTraining = trainingStats.total >= MIN_TRAINING_POINTS;
-        } catch (_) { /* collection might not exist yet */ }
+        if (qdrantAvailable) {
+            try {
+                const trainingStats = await getTrainingStats();
+                hasTraining = trainingStats.total >= MIN_TRAINING_POINTS;
+            } catch (_) { /* collection might not exist yet */ }
+        }
 
         // 3. Score candidate images with limited concurrency
         const scoredAssets = await scoreAssets({ assets, immichBase, apiKey, hasTraining });

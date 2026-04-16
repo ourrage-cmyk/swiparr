@@ -31,9 +31,28 @@ export interface ImmichAsset {
   }
 }
 
+export interface QualitySignals {
+  overall: number
+  blur: number
+  exposure: number
+  noise: number
+  screenshot: number
+  meanLuma: number
+  darkClip: number
+  brightClip: number
+  edgeDensity: number
+  lowSaturation: number
+  laplacianVariance: number
+  noiseResidual: number
+  reasons: string[]
+}
+
 export interface ScoredAsset {
   asset: ImmichAsset
   score: number
+  clipScore?: number
+  qualityScore?: number
+  signals?: QualitySignals
   imgUrl?: string
 }
 
