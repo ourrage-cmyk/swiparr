@@ -14,6 +14,7 @@ transformersEnv.localModelPath = path.join(process.cwd(), 'models');
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const APP_DATA_DIR = process.env.APP_DATA_DIR || __dirname;
+const LOG_FILE = path.join(APP_DATA_DIR, 'swiparr.log');
 
 const app = express();
 app.use(cors());
@@ -122,6 +123,9 @@ const SCORE_NEIGHBOR_COUNT = 24;
 const SCORE_CLIP_WEIGHT = 0.72;
 const SCORE_QUALITY_WEIGHT = 0.28;
 const QUALITY_SAMPLE_TARGET = 256;
+const ARCHIVE_REQUEST_CHUNK_SIZE = 25;
+const ALBUM_ADD_CHUNK_SIZE = 25;
+const LOG_TAIL_LINE_LIMIT = 200;
 const REVIEW_CANDIDATE_TARGET_DEFAULT = 12;
 const REVIEW_CANDIDATE_TARGET_MIN = 4;
 const REVIEW_CANDIDATE_TARGET_MAX = 40;
@@ -149,6 +153,18 @@ const AUTO_ARCHIVE_CONFIDENCE_THRESHOLD = 0.2;
 const ARCHIVED_ALBUM_NAME = 'archived';
 const ARCHIVE_VISIBILITY = 'archive';
 const TIMELINE_VISIBILITY = 'timeline';
+
+function logEvent(level, scope, message, details = null) {
+    const timestamp = new Date().toISOString();
+    const serializedDetails = details ? ` ${JSON.stringify(details)}` : '';
+    const line = `[${timestamp}] [${level}] [${scope}] ${message}${serializedDetails}`;
+    console.log(line);
+    try {
+        fs.appendFileSync(LOG_FILE, `${line}\n`, 'utf-8');
+    } catch (error) {
+        console.warn('[Logging] Failed to write log file:', error.message);
+    }
+}
 
 async function ensureQdrantReady() {
     if (qdrantReady) {
@@ -445,7 +461,8 @@ function combineScores({ clipScore, qualityScore, hasTraining }) {
         return qualityScore;
     }
 
-    return clamp01((clipScore * SCORE_CLIP_WEIGHT) + (qualityScore * SCORE_QUALITY_WEIGHT));
+    const blended = clamp01((clipScore * SCORE_CLIP_WEIGHT) + (qualityScore * SCORE_QUALITY_WEIGHT));
+    return Math.min(clipScore, blended);
 }
 
 async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
@@ -592,32 +609,66 @@ async function ensureArchivedAlbum(immichBase, apiKey) {
 }
 
 async function addAssetsToAlbum(immichBase, apiKey, albumId, assetIds) {
-    const response = await fetch(`${immichBase}/api/albums/${albumId}/assets`, {
-        method: 'PUT',
-        headers: {
-            'x-api-key': apiKey,
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ ids: assetIds }),
-    });
+    const addedIds = [];
+    const failedItems = [];
 
-    if (!response.ok) {
-        const errorText = await response.text().catch(() => '');
-        throw new Error(`Immich add-to-album failed (${response.status}): ${errorText}`);
+    for (const batchIds of chunkItems(assetIds, ALBUM_ADD_CHUNK_SIZE)) {
+        const response = await fetch(`${immichBase}/api/albums/${albumId}/assets`, {
+            method: 'PUT',
+            headers: {
+                'x-api-key': apiKey,
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ ids: batchIds }),
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text().catch(() => '');
+            failedItems.push(...batchIds.map((id) => ({ id, errorMessage: errorText || `HTTP ${response.status}` })));
+            logEvent('ERROR', 'Album', 'Chunk add failed', { albumId, count: batchIds.length, status: response.status, errorText });
+            continue;
+        }
+
+        const results = await response.json().catch(() => []);
+        const statuses = Array.isArray(results) ? results : [];
+        if (statuses.length === 0) {
+            addedIds.push(...batchIds);
+            continue;
+        }
+
+        for (const item of statuses) {
+            if (item?.success) {
+                addedIds.push(item.id);
+                continue;
+            }
+
+            const errorMessage = item?.errorMessage || item?.error || 'Unknown album add error';
+            if (/already|exists|duplicate/i.test(String(errorMessage))) {
+                addedIds.push(item.id);
+                continue;
+            }
+
+            failedItems.push({ id: item?.id || 'unknown', errorMessage });
+        }
     }
 
-    const results = await response.json().catch(() => []);
-    const failed = Array.isArray(results) ? results.filter((item) => !item.success) : [];
-    if (failed.length > 0) {
-        throw new Error(`Immich add-to-album failed for ${failed.length} assets.`);
+    if (failedItems.length > 0) {
+        logEvent('WARN', 'Album', 'Some assets failed to add to archived album', {
+            albumId,
+            failedCount: failedItems.length,
+            sample: failedItems.slice(0, 5),
+        });
     }
+
+    return { addedIds, failedItems };
 }
 
 async function archiveAssetsWithVerification({ immichBase, headers, apiKey, assetIds, chunkSize }) {
     const verifiedArchivedIds = [];
 
     for (const batchIds of chunkItems(assetIds, chunkSize)) {
+        logEvent('INFO', 'Archive', 'Submitting archive batch', { count: batchIds.length });
         await archiveAssetBatch(immichBase, headers, batchIds);
 
         for (const assetId of batchIds) {
@@ -633,10 +684,10 @@ async function archiveAssetsWithVerification({ immichBase, headers, apiKey, asse
                 if (retriedDetails.isArchived || retriedDetails.visibility === ARCHIVE_VISIBILITY) {
                     verifiedArchivedIds.push(assetId);
                 } else {
-                    console.warn(`[Cron] Asset ${assetId} did not verify as archived after retry.`);
+                    logEvent('WARN', 'Archive', 'Asset did not verify as archived after retry', { assetId });
                 }
             } catch (error) {
-                console.warn(`[Cron] Verification failed for ${assetId}: ${error.message}`);
+                logEvent('WARN', 'Archive', 'Verification failed', { assetId, error: error.message });
             }
         }
     }
@@ -817,27 +868,38 @@ app.post('/api/triage/apply', async (req, res) => {
 
         const immichBase = immichUrl.endsWith('/') ? immichUrl.slice(0, -1) : immichUrl;
         const headers = { 'x-api-key': apiKey, 'Accept': 'application/json' };
+        logEvent('INFO', 'TriageApply', 'Applying manual triage archive batch', { requestedCount: normalizedAssetIds.length });
         const verifiedArchivedIds = await archiveAssetsWithVerification({
             immichBase,
             headers,
             apiKey,
             assetIds: normalizedAssetIds,
-            chunkSize: Math.min(normalizedAssetIds.length, AUTO_ARCHIVE_ARCHIVE_BATCH_MAX),
+            chunkSize: Math.min(ARCHIVE_REQUEST_CHUNK_SIZE, AUTO_ARCHIVE_ARCHIVE_BATCH_MAX),
         });
+
+        let albumAddFailedCount = 0;
 
         if (verifiedArchivedIds.length > 0) {
             const archivedAlbum = await ensureArchivedAlbum(immichBase, apiKey);
-            await addAssetsToAlbum(immichBase, apiKey, archivedAlbum.id, verifiedArchivedIds);
+            const albumResult = await addAssetsToAlbum(immichBase, apiKey, archivedAlbum.id, verifiedArchivedIds);
+            albumAddFailedCount = albumResult.failedItems.length;
         }
+
+        logEvent('INFO', 'TriageApply', 'Manual triage archive completed', {
+            requestedCount: normalizedAssetIds.length,
+            archivedCount: verifiedArchivedIds.length,
+            albumAddFailedCount,
+        });
 
         res.json({
             success: true,
             archivedCount: verifiedArchivedIds.length,
             archivedIds: verifiedArchivedIds,
             requestedCount: normalizedAssetIds.length,
+            albumAddFailedCount,
         });
     } catch (e) {
-        console.error('[Triage Apply] Error:', e.message);
+        logEvent('ERROR', 'TriageApply', 'Manual triage archive failed', { error: e.message });
         res.status(500).json({ error: e.message });
     }
 });
@@ -897,6 +959,20 @@ app.get('/api/settings', (req, res) => {
     res.json(appSettings);
 });
 
+app.get('/api/logs', (_req, res) => {
+    try {
+        if (!fs.existsSync(LOG_FILE)) {
+            return res.json({ lines: [] });
+        }
+
+        const contents = fs.readFileSync(LOG_FILE, 'utf-8');
+        const lines = contents.split('\n').filter(Boolean).slice(-LOG_TAIL_LINE_LIMIT);
+        res.json({ lines });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.post('/api/settings', (req, res) => {
     appSettings = sanitizeSettings({ ...appSettings, ...req.body });
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify(appSettings, null, 2));
@@ -949,6 +1025,12 @@ async function runAutoArchive(options = {}) {
         const candidateMap = new Map();
         const scanBatchSize = Number(appSettings.autoArchiveScanBatchSize ?? AUTO_ARCHIVE_SCAN_BATCH_SIZE);
         const scanBatchesPerRun = Number(appSettings.autoArchiveScanBatchesPerRun ?? AUTO_ARCHIVE_BATCHES_PER_RUN);
+        logEvent('INFO', 'Cron', 'Starting auto-archive run', {
+            dryRun,
+            threshold: Number(appSettings.autoArchiveConfidenceThreshold ?? AUTO_ARCHIVE_CONFIDENCE_THRESHOLD),
+            scanBatchSize,
+            scanBatchesPerRun,
+        });
         for (let batchIndex = 0; batchIndex < scanBatchesPerRun; batchIndex += 1) {
             const randResp = await fetchRandomTimelineAssets(immichBase, headers, scanBatchSize);
             if (!randResp.ok) throw new Error('Immich API Error ' + randResp.status);
@@ -975,29 +1057,42 @@ async function runAutoArchive(options = {}) {
             .slice(0, maxArchiveCount)
             .map(item => item.asset.id);
 
+        logEvent('INFO', 'Cron', 'Auto-archive scoring completed', {
+            scannedCount: candidateMap.size,
+            threshold,
+            candidateBelowThreshold: badAssetIds.length,
+            lowestScores: scoredAssets.slice().sort((left, right) => left.score - right.score).slice(0, 5).map((item) => ({ id: item.asset.id, score: item.score })),
+        });
+
         if (badAssetIds.length > 0) {
             if (dryRun) {
-                console.log(`[Cron] Dry run selected ${badAssetIds.length} bad assets.`);
+                logEvent('INFO', 'Cron', 'Dry run selected archive candidates', { count: badAssetIds.length });
             } else {
-                console.log(`[Cron] Archiving ${badAssetIds.length} bad assets in batches.`);
+                logEvent('INFO', 'Cron', 'Archiving candidates', { count: badAssetIds.length });
                 const verifiedArchivedIds = await archiveAssetsWithVerification({
                     immichBase,
                     headers,
                     apiKey: API_KEY,
                     assetIds: badAssetIds,
-                    chunkSize: maxArchiveCount,
+                    chunkSize: Math.min(ARCHIVE_REQUEST_CHUNK_SIZE, maxArchiveCount),
                 });
+                let albumAddFailedCount = 0;
                 if (verifiedArchivedIds.length > 0) {
                     const archivedAlbum = await ensureArchivedAlbum(immichBase, API_KEY);
-                    await addAssetsToAlbum(immichBase, API_KEY, archivedAlbum.id, verifiedArchivedIds);
+                    const albumResult = await addAssetsToAlbum(immichBase, API_KEY, archivedAlbum.id, verifiedArchivedIds);
+                    albumAddFailedCount = albumResult.failedItems.length;
                 }
-                console.log(`[Cron] Verified ${verifiedArchivedIds.length} archived assets.`);
+                logEvent('INFO', 'Cron', 'Auto-archive completed', {
+                    verifiedArchivedCount: verifiedArchivedIds.length,
+                    albumAddFailedCount,
+                });
                 return {
                     skipped: false,
                     archivedCount: verifiedArchivedIds.length,
                     archivedIds: verifiedArchivedIds,
                     threshold,
                     scannedCount: candidateMap.size,
+                    albumAddFailedCount,
                 };
             }
             return {
@@ -1008,11 +1103,11 @@ async function runAutoArchive(options = {}) {
                 scannedCount: candidateMap.size,
             };
         } else {
-            console.log('[Cron] No bad assets found this cycle.');
+            logEvent('INFO', 'Cron', 'No archive candidates below threshold', { threshold, scannedCount: candidateMap.size });
             return { skipped: false, archivedCount: 0, archivedIds: [], threshold, scannedCount: candidateMap.size };
         }
     } catch (e) {
-        console.error('[Cron] Error:', e.message);
+        logEvent('ERROR', 'Cron', 'Auto-archive run failed', { error: e.message });
         throw e;
     }
 }

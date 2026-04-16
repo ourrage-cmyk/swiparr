@@ -110,6 +110,12 @@ export const useAiStore = defineStore('aiStore', () => {
         return await resp.json();
     }
 
+    async function fetchLogs() {
+        const resp = await fetch(getBackendUrl() + '/api/logs');
+        if (!resp.ok) throw new Error('Failed to fetch backend logs.');
+        return await resp.json();
+    }
+
     async function saveSettings(settings: Record<string, unknown>) {
         const resp = await fetch(getBackendUrl() + '/api/settings', {
             method: 'POST',
@@ -128,5 +134,5 @@ export const useAiStore = defineStore('aiStore', () => {
         return await resp.json();
     }
 
-    return { trainOnAsset, trainOnBatch, applyTriageBatch, fetchTriageBatch, fetchStats, fetchSettings, saveSettings, runAutoArchive };
+    return { trainOnAsset, trainOnBatch, applyTriageBatch, fetchTriageBatch, fetchStats, fetchSettings, fetchLogs, saveSettings, runAutoArchive };
 });

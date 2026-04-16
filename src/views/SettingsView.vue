@@ -13,6 +13,7 @@ const saving = ref(false)
 const running = ref(false)
 const trainingStats = ref({ total: 0, good: 0, bad: 0 })
 const lastRunResult = ref<Record<string, unknown> | null>(null)
+const recentLogs = ref<string[]>([])
 
 const settings = ref({
   autoArchive: false,
@@ -53,12 +54,14 @@ async function loadData() {
       aiStore.fetchSettings(),
       aiStore.fetchStats(),
     ])
+    const logs = await aiStore.fetchLogs().catch(() => ({ lines: [] }))
 
     settings.value = {
       ...settings.value,
       ...appSettings,
     }
     trainingStats.value = stats
+    recentLogs.value = Array.isArray(logs.lines) ? logs.lines : []
   } catch (e) {
     console.error('Failed to load settings:', e)
     uiStore.toast('Failed to load settings.', 'error')
@@ -270,6 +273,23 @@ onMounted(() => {
               <p v-if="'scannedCount' in lastRunResult"><strong>Scanned:</strong> {{ lastRunResult.scannedCount }}</p>
               <p v-if="'archivedCount' in lastRunResult"><strong>Archived:</strong> {{ lastRunResult.archivedCount }}</p>
               <p v-if="'threshold' in lastRunResult"><strong>Threshold:</strong> {{ lastRunResult.threshold }}</p>
+              <p v-if="'albumAddFailedCount' in lastRunResult"><strong>Album add failures:</strong> {{ lastRunResult.albumAddFailedCount }}</p>
+            </div>
+
+            <div class="mt-5 rounded-xl border p-4 text-sm"
+              :class="uiStore.isDarkMode ? 'border-gray-800 bg-black/50 text-gray-300' : 'border-gray-200 bg-white text-gray-700'"
+            >
+              <div class="flex items-center justify-between gap-3">
+                <p><strong>Recent backend logs</strong></p>
+                <button
+                  class="rounded-lg border px-3 py-1 text-xs transition-colors"
+                  :class="uiStore.isDarkMode ? 'border-gray-700 hover:bg-gray-900' : 'border-gray-300 hover:bg-gray-100'"
+                  @click="loadData()"
+                >
+                  Refresh
+                </button>
+              </div>
+              <pre class="mt-3 max-h-80 overflow-y-auto whitespace-pre-wrap font-mono text-xs">{{ recentLogs.length ? recentLogs.join('\n') : 'No logs yet.' }}</pre>
             </div>
           </section>
         </template>
