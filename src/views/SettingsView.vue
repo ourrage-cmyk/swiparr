@@ -11,7 +11,7 @@ const minimumTrainingPoints = 5
 const loading = ref(true)
 const saving = ref(false)
 const running = ref(false)
-const trainingStats = ref({ total: 0, good: 0, bad: 0 })
+const trainingStats = ref({ total: 0, good: 0, bad: 0, qualityPoints: 0 })
 const lastRunResult = ref<Record<string, unknown> | null>(null)
 const recentLogs = ref<string[]>([])
 
@@ -125,6 +125,9 @@ onMounted(() => {
           <p class="mt-2 text-sm" :class="uiStore.isDarkMode ? 'text-gray-400' : 'text-gray-600'">
             Manual vectors: {{ trainingStats.total }} total, {{ trainingStats.good }} keep, {{ trainingStats.bad }} archive.
             Cron only becomes useful after at least {{ minimumTrainingPoints }} manual decisions.
+          </p>
+          <p class="mt-2 text-sm" :class="uiStore.isDarkMode ? 'text-gray-400' : 'text-gray-600'">
+            Adaptive quality labels: {{ trainingStats.qualityPoints }} vectors with learned quality features.
           </p>
         </section>
 

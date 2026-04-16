@@ -14,7 +14,7 @@ type TriageItem = ScoredAsset & { selected: boolean }
 
 const loading = ref(true)
 const items = ref<TriageItem[]>([])
-const stats = ref({ total: 0, good: 0, bad: 0 })
+const stats = ref({ total: 0, good: 0, bad: 0, qualityPoints: 0 })
 const triageBatchSize = ref(60)
 const DEFAULT_TRIAGE_CUTOFF = 0.3
 const assistCutoff = ref(DEFAULT_TRIAGE_CUTOFF)
@@ -174,6 +174,7 @@ onMounted(() => {
         <h1 class="text-2xl font-bold mb-4">Triage Grid</h1>
         <p class="mb-4 text-sm text-gray-500">Uncheck photos you want to KEEP. Photos that remain checked will be marked as bad.</p>
         <p class="mb-4 text-sm text-gray-500">Training set: {{ stats.total }} vectors, {{ stats.good }} keep, {{ stats.bad }} archive.</p>
+        <p class="mb-4 text-sm text-gray-500">Adaptive quality model: {{ stats.qualityPoints }} labeled quality vectors.</p>
         <p class="mb-4 text-sm text-gray-500">Current triage batch size: {{ triageBatchSize }} images.</p>
         
         <div v-if="loading" class="flex flex-col items-center justify-center p-12">
@@ -259,6 +260,7 @@ onMounted(() => {
                         <div>Score: {{ item.score.toFixed(2) }}</div>
                         <div class="uppercase tracking-wide opacity-90">{{ getAssistRating(item) }}</div>
                         <div class="opacity-80">CLIP {{ (item.clipScore ?? 0.5).toFixed(2) }} · Quality {{ (item.qualityScore ?? 0.5).toFixed(2) }}</div>
+                        <div class="opacity-70">Heuristic {{ (item.qualityHeuristicScore ?? item.qualityScore ?? 0.5).toFixed(2) }} · {{ item.qualityProfile || 'global' }} · w {{ (item.qualityPenaltyStrength ?? 0).toFixed(2) }}</div>
                         <div v-if="item.signals?.reasons?.length" class="flex flex-wrap gap-1">
                             <span v-for="reason in item.signals.reasons.slice(0, 3)" :key="reason" class="rounded bg-red-500/70 px-1.5 py-0.5 uppercase tracking-wide">
                                 {{ formatSignalLabel(reason) }}

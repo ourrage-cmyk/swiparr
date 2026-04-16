@@ -52,6 +52,10 @@ export interface ScoredAsset {
   score: number
   clipScore?: number
   qualityScore?: number
+  qualityHeuristicScore?: number
+  qualityPenaltyStrength?: number
+  qualityProfile?: string
+  qualityTrainingPoints?: number
   signals?: QualitySignals
   imgUrl?: string
 }

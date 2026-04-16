@@ -113,6 +113,7 @@ const COLLECTION_NAME = 'immich_swipe_vectors';
 let qdrantReady = false;
 let qdrantInitPromise = null;
 let autoArchiveTask = null;
+let qualityModelCache = null;
 const TRIAGE_BATCH_DEFAULT = 60;
 const TRIAGE_BATCH_MIN = 12;
 const TRIAGE_BATCH_MAX = 250;
@@ -123,6 +124,9 @@ const SCORE_NEIGHBOR_COUNT = 24;
 const SCORE_CLIP_WEIGHT = 0.72;
 const SCORE_QUALITY_WEIGHT = 0.28;
 const QUALITY_SAMPLE_TARGET = 256;
+const QUALITY_FEATURE_VERSION = 1;
+const QUALITY_MODEL_MIN_POINTS = 20;
+const QUALITY_MODEL_POINT_LIMIT = 50000;
 const ARCHIVE_REQUEST_CHUNK_SIZE = 25;
 const ALBUM_ADD_CHUNK_SIZE = 25;
 const LOG_TAIL_LINE_LIMIT = 200;
@@ -406,6 +410,264 @@ function analyzeImageQuality(image, asset = null) {
     };
 }
 
+function getAssetDimensions(asset, image) {
+    const width = Number(asset?.width || asset?.exifInfo?.exifImageWidth || image?.width || 0);
+    const height = Number(asset?.height || asset?.exifInfo?.exifImageHeight || image?.height || 0);
+    return { width, height, maxDimension: Math.max(width, height) };
+}
+
+function getCaptureYear(asset) {
+    const raw = asset?.localDateTime || asset?.fileCreatedAt || asset?.updatedAt || null;
+    if (!raw) return null;
+    const year = new Date(raw).getUTCFullYear();
+    return Number.isFinite(year) ? year : null;
+}
+
+function inferQualityProfile(signals, asset, image) {
+    if ((1 - signals.screenshot) > 0.65) {
+        return 'screenshot';
+    }
+
+    const captureYear = getCaptureYear(asset);
+    const { maxDimension } = getAssetDimensions(asset, image);
+    if ((captureYear && captureYear < 2012) || maxDimension < 1800) {
+        return 'legacy';
+    }
+
+    return 'modern';
+}
+
+function buildQualityFeaturePayload(signals, asset, image) {
+    const { width, height, maxDimension } = getAssetDimensions(asset, image);
+    const captureYear = getCaptureYear(asset);
+    const profile = inferQualityProfile(signals, asset, image);
+    const aspectRatio = width > 0 && height > 0 ? width / height : 1;
+
+    return {
+        version: QUALITY_FEATURE_VERSION,
+        profile,
+        values: {
+            blur: clamp01(signals.blur),
+            exposure: clamp01(signals.exposure),
+            noise: clamp01(signals.noise),
+            screenshot: clamp01(signals.screenshot),
+            lowSaturation: clamp01(1 - signals.lowSaturation),
+            edgeDensity: clamp01(signals.edgeDensity),
+            resolution: clamp01(normalizeRange(maxDimension, 1000, 4000)),
+            portraitBias: clamp01(Math.abs(Math.log(aspectRatio || 1)) / 1.2),
+            captureEra: captureYear ? clamp01(normalizeRange(captureYear, 2000, 2024)) : 0.5,
+        },
+    };
+}
+
+function getQualityFeatureVector(qualityFeatures) {
+    if (!qualityFeatures || qualityFeatures.version !== QUALITY_FEATURE_VERSION) {
+        return null;
+    }
+
+    const values = qualityFeatures.values || {};
+    return [
+        clamp01(values.blur ?? 0.5),
+        clamp01(values.exposure ?? 0.5),
+        clamp01(values.noise ?? 0.5),
+        clamp01(values.screenshot ?? 0.5),
+        clamp01(values.lowSaturation ?? 0.5),
+        clamp01(values.edgeDensity ?? 0.5),
+        clamp01(values.resolution ?? 0.5),
+        clamp01(values.portraitBias ?? 0.5),
+        clamp01(values.captureEra ?? 0.5),
+    ];
+}
+
+function createEmptyQualityBucket() {
+    return {
+        keepCount: 0,
+        badCount: 0,
+        keepSums: null,
+        badSums: null,
+    };
+}
+
+function accumulateQualityVector(bucket, vector, isKeep) {
+    const sumKey = isKeep ? 'keepSums' : 'badSums';
+    const countKey = isKeep ? 'keepCount' : 'badCount';
+    if (!bucket[sumKey]) {
+        bucket[sumKey] = new Array(vector.length).fill(0);
+    }
+    vector.forEach((value, index) => {
+        bucket[sumKey][index] += value;
+    });
+    bucket[countKey] += 1;
+}
+
+function finalizeQualityBucket(bucket) {
+    if (!bucket.keepCount || !bucket.badCount || !bucket.keepSums || !bucket.badSums) {
+        return null;
+    }
+
+    const keepMean = bucket.keepSums.map((value) => value / bucket.keepCount);
+    const badMean = bucket.badSums.map((value) => value / bucket.badCount);
+    const weights = keepMean.map((value, index) => Math.abs(value - badMean[index]));
+    const separation = weights.reduce((sum, value) => sum + value, 0) / weights.length;
+    const support = Math.min(1, Math.sqrt((bucket.keepCount + bucket.badCount) / QUALITY_MODEL_MIN_POINTS));
+    const strength = clamp01(separation * 1.8) * Math.min(0.85, Math.max(0.2, support));
+
+    return {
+        keepMean,
+        badMean,
+        weights,
+        strength,
+        support,
+        pointCount: bucket.keepCount + bucket.badCount,
+    };
+}
+
+async function getAllManualPoints() {
+    const manualPoints = [];
+    let offset = undefined;
+
+    while (manualPoints.length < QUALITY_MODEL_POINT_LIMIT) {
+        const response = await qdrant.scroll(COLLECTION_NAME, {
+            limit: 1000,
+            offset,
+            with_payload: true,
+        });
+        const points = Array.isArray(response?.points) ? response.points : [];
+        if (points.length === 0) {
+            break;
+        }
+
+        manualPoints.push(...points.filter(isManualTrainingPoint));
+        if (!response.next_page_offset) {
+            break;
+        }
+        offset = response.next_page_offset;
+    }
+
+    return manualPoints;
+}
+
+function buildAdaptiveQualityModel(manualPoints) {
+    const globalBucket = createEmptyQualityBucket();
+    const buckets = new Map();
+    let featurePointCount = 0;
+
+    for (const point of manualPoints) {
+        const vector = getQualityFeatureVector(point?.payload?.qualityFeatures);
+        if (!vector) {
+            continue;
+        }
+
+        featurePointCount += 1;
+        const profile = point?.payload?.qualityFeatures?.profile || 'global';
+        if (!buckets.has(profile)) {
+            buckets.set(profile, createEmptyQualityBucket());
+        }
+        accumulateQualityVector(globalBucket, vector, Boolean(point?.payload?.isKeep));
+        accumulateQualityVector(buckets.get(profile), vector, Boolean(point?.payload?.isKeep));
+    }
+
+    const models = new Map();
+    const globalModel = finalizeQualityBucket(globalBucket);
+    if (globalModel) {
+        models.set('global', globalModel);
+    }
+
+    for (const [profile, bucket] of buckets.entries()) {
+        const model = finalizeQualityBucket(bucket);
+        if (model) {
+            models.set(profile, model);
+        }
+    }
+
+    return {
+        featurePointCount,
+        models,
+    };
+}
+
+function getPointId(point) {
+    return String(point?.id || '');
+}
+
+async function backfillQualityFeatures({ manualPoints, immichBase, apiKey, limit = QUALITY_MODEL_MIN_POINTS }) {
+    const candidates = manualPoints
+        .filter((point) => !getQualityFeatureVector(point?.payload?.qualityFeatures))
+        .slice(0, limit);
+
+    if (candidates.length === 0) {
+        return 0;
+    }
+
+    let updatedCount = 0;
+    await mapWithConcurrency(candidates, 2, async (point) => {
+        const assetId = getPointId(point);
+        if (!assetId) {
+            return null;
+        }
+
+        try {
+            const assetDetails = await fetchAssetDetails(immichBase, apiKey, assetId).catch(() => null);
+            const thumbUrl = `${immichBase}/api/assets/${assetId}/thumbnail?size=preview`;
+            const image = await fetchAnalysisImage(thumbUrl, apiKey);
+            const signals = analyzeImageQuality(image, assetDetails);
+            const qualityFeatures = buildQualityFeaturePayload(signals, assetDetails, image);
+            await qdrant.setPayload(COLLECTION_NAME, {
+                wait: true,
+                points: [assetId],
+                payload: { qualityFeatures },
+            });
+            point.payload = {
+                ...(point.payload || {}),
+                qualityFeatures,
+            };
+            updatedCount += 1;
+            return true;
+        } catch (error) {
+            logEvent('WARN', 'QualityBackfill', 'Failed to backfill quality features', { assetId, error: error.message });
+            return null;
+        }
+    });
+
+    if (updatedCount > 0) {
+        qualityModelCache = null;
+        logEvent('INFO', 'QualityBackfill', 'Backfilled quality features for manual labels', { updatedCount });
+    }
+
+    return updatedCount;
+}
+
+function scoreQualityFromModel(model, qualityFeatures) {
+    const vector = getQualityFeatureVector(qualityFeatures);
+    if (!model || !vector) {
+        return null;
+    }
+
+    const profileModel = model.models.get(qualityFeatures.profile) || model.models.get('global');
+    if (!profileModel) {
+        return null;
+    }
+
+    let keepDistance = 0;
+    let badDistance = 0;
+    for (let index = 0; index < vector.length; index += 1) {
+        const weight = Math.max(profileModel.weights[index], 0.05);
+        keepDistance += weight * ((vector[index] - profileModel.keepMean[index]) ** 2);
+        badDistance += weight * ((vector[index] - profileModel.badMean[index]) ** 2);
+    }
+
+    const totalDistance = keepDistance + badDistance;
+    const score = totalDistance > 0 ? clamp01(badDistance / totalDistance) : 0.5;
+
+    return {
+        score,
+        strength: profileModel.strength,
+        support: profileModel.support,
+        pointCount: profileModel.pointCount,
+        profile: qualityFeatures.profile,
+    };
+}
+
 function scoreFromNeighbors(searchRes) {
     const neighbors = searchRes.slice(0, SCORE_NEIGHBOR_COUNT);
     if (neighbors.length === 0) {
@@ -442,30 +704,41 @@ function isManualTrainingPoint(point) {
 }
 
 async function getTrainingStats() {
-    const allPoints = await qdrant.scroll(COLLECTION_NAME, {
-        limit: 10000,
-        with_payload: true,
-    });
-    const manualPoints = allPoints.points.filter(isManualTrainingPoint);
+    const manualPoints = await getAllManualPoints();
     const good = manualPoints.filter(point => point.payload.isKeep).length;
     const bad = manualPoints.filter(point => !point.payload.isKeep).length;
+    const qualityPoints = manualPoints.filter((point) => getQualityFeatureVector(point?.payload?.qualityFeatures)).length;
     return {
         total: manualPoints.length,
         good,
         bad,
+        qualityPoints,
     };
 }
 
-function combineScores({ clipScore, qualityScore, hasTraining }) {
+async function getAdaptiveQualityModel({ immichBase = null, apiKey = null } = {}) {
+    if (qualityModelCache) {
+        return qualityModelCache;
+    }
+
+    const manualPoints = await getAllManualPoints();
+    const model = buildAdaptiveQualityModel(manualPoints);
+    qualityModelCache = model;
+    return model;
+}
+
+function combineScores({ clipScore, qualityScore, qualityPenaltyStrength, hasTraining }) {
     if (!hasTraining) {
         return qualityScore;
     }
 
-    const blended = clamp01((clipScore * SCORE_CLIP_WEIGHT) + (qualityScore * SCORE_QUALITY_WEIGHT));
-    return Math.min(clipScore, blended);
+    const penalty = (1 - qualityScore) * clamp01(qualityPenaltyStrength);
+    return clamp01(clipScore - penalty);
 }
 
 async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
+    const adaptiveQualityModel = hasTraining ? await getAdaptiveQualityModel({ immichBase, apiKey }) : null;
+
     return mapWithConcurrency(
         assets.filter(asset => asset.type === 'IMAGE' && !asset.isArchived && !asset.isTrashed && asset.visibility !== ARCHIVE_VISIBILITY),
         TRIAGE_CONCURRENCY,
@@ -474,7 +747,11 @@ async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
                 const thumbUrl = `${immichBase}/api/assets/${asset.id}/thumbnail?size=preview`;
                 const image = await fetchAnalysisImage(thumbUrl, apiKey);
                 const signals = analyzeImageQuality(image, asset);
-                const qualityScore = signals.overall;
+                const qualityFeatures = buildQualityFeaturePayload(signals, asset, image);
+                const learnedQuality = scoreQualityFromModel(adaptiveQualityModel, qualityFeatures);
+                const heuristicQualityScore = signals.overall;
+                const qualityScore = learnedQuality?.score ?? heuristicQualityScore;
+                const qualityPenaltyStrength = learnedQuality?.strength ?? SCORE_QUALITY_WEIGHT;
 
                 let clipScore = 0.5;
                 if (hasTraining) {
@@ -487,13 +764,17 @@ async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
                     clipScore = scoreFromNeighbors(searchRes.filter(isManualTrainingPoint));
                 }
 
-                const score = combineScores({ clipScore, qualityScore, hasTraining });
+                const score = combineScores({ clipScore, qualityScore, qualityPenaltyStrength, hasTraining });
 
                 return {
                     asset,
                     score,
                     clipScore,
                     qualityScore,
+                    qualityHeuristicScore: heuristicQualityScore,
+                    qualityPenaltyStrength,
+                    qualityProfile: qualityFeatures.profile,
+                    qualityTrainingPoints: adaptiveQualityModel?.featurePointCount ?? 0,
                     signals,
                     imgUrl: thumbUrl,
                 };
@@ -717,8 +998,11 @@ app.post('/api/swipe', async (req, res) => {
         }
 
         const immichBase = immichUrl.endsWith('/') ? immichUrl.slice(0, -1) : immichUrl;
+        const assetDetails = await fetchAssetDetails(immichBase, apiKey, assetId).catch(() => null);
         const thumbUrl = `${immichBase}/api/assets/${assetId}/thumbnail?size=preview`;
         const image = await fetchAnalysisImage(thumbUrl, apiKey);
+        const signals = analyzeImageQuality(image, assetDetails);
+        const qualityFeatures = buildQualityFeaturePayload(signals, assetDetails, image);
         const embedding = await extractEmbeddingFromImage(image);
 
         await qdrant.upsert(COLLECTION_NAME, {
@@ -730,9 +1014,11 @@ app.post('/api/swipe', async (req, res) => {
                     isKeep,
                     source: MANUAL_SOURCE,
                     trainedAt: new Date().toISOString(),
+                    qualityFeatures,
                 },
             }],
         });
+        qualityModelCache = null;
         res.json({ success: true });
     } catch (e) {
         console.error('[Swipe] Error:', e.message);
