@@ -17,6 +17,7 @@ const items = ref<TriageItem[]>([])
 const stats = ref({ total: 0, good: 0, bad: 0, qualityPoints: 0 })
 const triageBatchSize = ref(60)
 const DEFAULT_TRIAGE_CUTOFF = 0.3
+const TARGET_ARCHIVE_RATE = 0.1
 const assistCutoff = ref(DEFAULT_TRIAGE_CUTOFF)
 const autoArchiveThreshold = ref(0.2)
 const savingAssistThreshold = ref(false)
@@ -43,26 +44,39 @@ const hasLabelOverlap = computed(() => {
     return highestSelectedScore.value > lowestKeptScore.value
 })
 
+const batchTargetThreshold = computed(() => {
+    if (!items.value.length) return assistCutoff.value
+    const sortedScores = items.value
+        .map((item) => item.score)
+        .sort((left, right) => left - right)
+    const thresholdIndex = Math.min(
+        sortedScores.length - 1,
+        Math.max(0, Math.ceil(sortedScores.length * TARGET_ARCHIVE_RATE) - 1),
+    )
+    return clamp01(sortedScores[thresholdIndex] ?? assistCutoff.value)
+})
+
 const suggestedThreshold = computed(() => {
     if (highestSelectedScore.value !== null && lowestKeptScore.value !== null && !hasLabelOverlap.value) {
-        return clamp01((highestSelectedScore.value + lowestKeptScore.value) / 2)
+        const manualThreshold = clamp01((highestSelectedScore.value + lowestKeptScore.value) / 2)
+        return clamp01((manualThreshold * 0.75) + (batchTargetThreshold.value * 0.25))
     }
     if (highestSelectedScore.value !== null && lowestKeptScore.value === null) {
-        return clamp01(highestSelectedScore.value + 0.03)
+        return clamp01((clamp01(highestSelectedScore.value + 0.03) * 0.75) + (batchTargetThreshold.value * 0.25))
     }
     if (highestSelectedScore.value === null && lowestKeptScore.value !== null) {
-        return clamp01(lowestKeptScore.value - 0.03)
+        return clamp01((clamp01(lowestKeptScore.value - 0.03) * 0.75) + (batchTargetThreshold.value * 0.25))
     }
-    return assistCutoff.value
+    return batchTargetThreshold.value
 })
 
 const suggestedMessage = computed(() => {
     if (!items.value.length) return 'Load a batch to get a threshold suggestion.'
     if (!selectedItems.value.length || !keptItems.value.length) {
-        return 'Mark at least one photo as bad and keep one as good to estimate a useful threshold from this batch.'
+        return `Mark at least one photo as bad and keep one as good to refine the cutoff. Until then, the suggestion tracks roughly the worst ${Math.round(TARGET_ARCHIVE_RATE * 100)}% of this batch.`
     }
     if (hasLabelOverlap.value) {
-        return 'Your manual picks overlap the current score ordering. Keep training; do not tighten auto-archive yet from this batch alone.'
+        return `Your manual picks overlap the current score ordering. Keep training; the fallback suggestion is anchored to roughly the worst ${Math.round(TARGET_ARCHIVE_RATE * 100)}% of this batch.`
     }
     return 'This suggested threshold cleanly separates your current bad selections from the photos you kept in this batch.'
 })
@@ -204,6 +218,10 @@ onMounted(() => {
                         <div class="rounded-xl border px-3 py-2" :class="uiStore.isDarkMode ? 'border-gray-800 bg-black/40' : 'border-gray-200 bg-white'">
                             <div class="text-xs uppercase tracking-wide opacity-70">Suggested</div>
                             <div class="mt-1 font-mono text-lg">{{ suggestedThreshold.toFixed(2) }}</div>
+                        </div>
+                        <div class="rounded-xl border px-3 py-2" :class="uiStore.isDarkMode ? 'border-gray-800 bg-black/40' : 'border-gray-200 bg-white'">
+                            <div class="text-xs uppercase tracking-wide opacity-70">10% batch cutoff</div>
+                            <div class="mt-1 font-mono text-lg">{{ batchTargetThreshold.toFixed(2) }}</div>
                         </div>
                         <div class="rounded-xl border px-3 py-2" :class="uiStore.isDarkMode ? 'border-gray-800 bg-black/40' : 'border-gray-200 bg-white'">
                             <div class="text-xs uppercase tracking-wide opacity-70">Marked bad</div>

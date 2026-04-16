@@ -121,8 +121,11 @@ const TRIAGE_CONCURRENCY = 4;
 const MIN_TRAINING_POINTS = 5;
 const SCORE_SEARCH_LIMIT = 128;
 const SCORE_NEIGHBOR_COUNT = 24;
-const SCORE_CLIP_WEIGHT = 0.72;
+const SCORE_PRIOR_REBALANCE_EXPONENT = 0.5;
+const SCORE_NEIGHBOR_RANGE_MIN = 0.015;
+const SCORE_NEIGHBOR_RANGE_MAX = 0.12;
 const SCORE_QUALITY_WEIGHT = 0.28;
+const QUALITY_PENALTY_FLOOR = 0.42;
 const QUALITY_SAMPLE_TARGET = 256;
 const QUALITY_FEATURE_VERSION = 1;
 const QUALITY_MODEL_MIN_POINTS = 20;
@@ -551,8 +554,16 @@ function buildAdaptiveQualityModel(manualPoints) {
     const globalBucket = createEmptyQualityBucket();
     const buckets = new Map();
     let featurePointCount = 0;
+    let keepCount = 0;
+    let badCount = 0;
 
     for (const point of manualPoints) {
+        if (point?.payload?.isKeep) {
+            keepCount += 1;
+        } else {
+            badCount += 1;
+        }
+
         const vector = getQualityFeatureVector(point?.payload?.qualityFeatures);
         if (!vector) {
             continue;
@@ -582,6 +593,9 @@ function buildAdaptiveQualityModel(manualPoints) {
 
     return {
         featurePointCount,
+        keepCount,
+        badCount,
+        totalCount: manualPoints.length,
         models,
     };
 }
@@ -668,18 +682,27 @@ function scoreQualityFromModel(model, qualityFeatures) {
     };
 }
 
-function scoreFromNeighbors(searchRes) {
+function scoreFromNeighbors(searchRes, trainingModel = null) {
     const neighbors = searchRes.slice(0, SCORE_NEIGHBOR_COUNT);
     if (neighbors.length === 0) {
-        return 0.5;
+        return { score: 0.5, confidence: 0 };
     }
 
+    const similarities = neighbors.map((point) => Math.max(0, Number(point?.score) || 0));
+    const minSimilarity = Math.min(...similarities);
+    const maxSimilarity = Math.max(...similarities);
+    const similarityRange = maxSimilarity - minSimilarity;
     let keepWeight = 0;
     let badWeight = 0;
 
-    for (const point of neighbors) {
-        const similarity = Math.max(0, Number(point?.score) || 0);
-        const weight = similarity * similarity;
+    for (let index = 0; index < neighbors.length; index += 1) {
+        const point = neighbors[index];
+        const similarity = similarities[index];
+        const normalizedSimilarity = similarityRange > 0.000001
+            ? (similarity - minSimilarity) / similarityRange
+            : 0.5;
+        const rankWeight = 1 - (index / (neighbors.length + 1));
+        const weight = Math.max(0.05, (0.35 + (normalizedSimilarity * 0.65)) * rankWeight);
         if (weight === 0) {
             continue;
         }
@@ -693,10 +716,27 @@ function scoreFromNeighbors(searchRes) {
 
     const totalWeight = keepWeight + badWeight;
     if (totalWeight === 0) {
-        return 0.5;
+        return { score: 0.5, confidence: 0 };
     }
 
-    return keepWeight / totalWeight;
+    const keepPrior = trainingModel?.totalCount
+        ? Math.max(0.05, trainingModel.keepCount / trainingModel.totalCount)
+        : 0.5;
+    const badPrior = trainingModel?.totalCount
+        ? Math.max(0.05, trainingModel.badCount / trainingModel.totalCount)
+        : 0.5;
+    const rebalancedKeep = keepWeight / Math.pow(keepPrior, SCORE_PRIOR_REBALANCE_EXPONENT);
+    const rebalancedBad = badWeight / Math.pow(badPrior, SCORE_PRIOR_REBALANCE_EXPONENT);
+    const rebalancedTotal = rebalancedKeep + rebalancedBad;
+    const posterior = rebalancedTotal > 0 ? rebalancedKeep / rebalancedTotal : 0.5;
+    const rangeConfidence = clamp01(normalizeRange(similarityRange, SCORE_NEIGHBOR_RANGE_MIN, SCORE_NEIGHBOR_RANGE_MAX));
+    const localAgreement = totalWeight > 0 ? Math.abs(keepWeight - badWeight) / totalWeight : 0;
+    const confidence = clamp01(0.2 + (rangeConfidence * 0.45) + (localAgreement * 0.35));
+
+    return {
+        score: clamp01(0.5 + ((posterior - 0.5) * confidence)),
+        confidence,
+    };
 }
 
 function isManualTrainingPoint(point) {
@@ -732,8 +772,20 @@ function combineScores({ clipScore, qualityScore, qualityPenaltyStrength, hasTra
         return qualityScore;
     }
 
-    const penalty = (1 - qualityScore) * clamp01(qualityPenaltyStrength);
+    const strength = clamp01(Math.max(QUALITY_PENALTY_FLOOR, qualityPenaltyStrength));
+    const penalty = (1 - qualityScore) * (0.25 + (0.75 * strength));
     return clamp01(clipScore - penalty);
+}
+
+function getQualityPenaltyStrength({ learnedQuality, heuristicQualityScore, signals }) {
+    let strength = learnedQuality?.strength ?? SCORE_QUALITY_WEIGHT;
+    strength = Math.max(strength, QUALITY_PENALTY_FLOOR);
+    strength += Math.max(0, 0.55 - heuristicQualityScore) * 0.45;
+    strength += Math.min(0.24, (signals?.reasons?.length ?? 0) * 0.06);
+    if (signals?.reasons?.includes('screenshot')) {
+        strength += 0.06;
+    }
+    return clamp01(strength);
 }
 
 async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
@@ -751,9 +803,14 @@ async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
                 const learnedQuality = scoreQualityFromModel(adaptiveQualityModel, qualityFeatures);
                 const heuristicQualityScore = signals.overall;
                 const qualityScore = learnedQuality?.score ?? heuristicQualityScore;
-                const qualityPenaltyStrength = learnedQuality?.strength ?? SCORE_QUALITY_WEIGHT;
+                const qualityPenaltyStrength = getQualityPenaltyStrength({
+                    learnedQuality,
+                    heuristicQualityScore,
+                    signals,
+                });
 
                 let clipScore = 0.5;
+                let clipConfidence = 0;
                 if (hasTraining) {
                     const embedding = await extractEmbeddingFromImage(image);
                     const searchRes = await qdrant.search(COLLECTION_NAME, {
@@ -761,7 +818,9 @@ async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
                         limit: SCORE_SEARCH_LIMIT,
                         with_payload: true,
                     });
-                    clipScore = scoreFromNeighbors(searchRes.filter(isManualTrainingPoint));
+                    const clipResult = scoreFromNeighbors(searchRes.filter(isManualTrainingPoint), adaptiveQualityModel);
+                    clipScore = clipResult.score;
+                    clipConfidence = clipResult.confidence;
                 }
 
                 const score = combineScores({ clipScore, qualityScore, qualityPenaltyStrength, hasTraining });
@@ -770,6 +829,7 @@ async function scoreAssets({ assets, immichBase, apiKey, hasTraining }) {
                     asset,
                     score,
                     clipScore,
+                    clipConfidence,
                     qualityScore,
                     qualityHeuristicScore: heuristicQualityScore,
                     qualityPenaltyStrength,
