@@ -28,6 +28,9 @@ export function useImmich() {
   const RANDOM_MAX_ATTEMPTS = 20
   const UNCERTAIN_QUEUE_TARGET = 12
   const UNCERTAIN_QUEUE_REFILL_THRESHOLD = 4
+  const UNCERTAIN_QUEUE_FETCH_LIMIT = 40
+  const UNCERTAIN_QUEUE_FETCH_PADDING = 6
+  const UNCERTAIN_QUEUE_REFILL_ATTEMPTS = 4
   const UNCERTAIN_SCAN_BATCH_SIZE = 40
   const UNCERTAIN_SCAN_BATCHES = 4
   const UNCERTAIN_MIN_SCORE_DEFAULT = 0.2
@@ -249,10 +252,10 @@ export function useImmich() {
     }
   }
 
-  async function fetchReviewCandidates(): Promise<ScoredAsset[]> {
+  async function fetchReviewCandidates(requestedCount: number = UNCERTAIN_QUEUE_TARGET): Promise<ScoredAsset[]> {
     await loadReviewCandidateSettings()
     const query = new URLSearchParams({
-      count: String(UNCERTAIN_QUEUE_TARGET),
+      count: String(Math.min(UNCERTAIN_QUEUE_FETCH_LIMIT, Math.max(1, requestedCount))),
       scanBatchSize: String(UNCERTAIN_SCAN_BATCH_SIZE),
       scanBatches: String(UNCERTAIN_SCAN_BATCHES),
       minScore: String(reviewCandidateSettings.value.minScore),
@@ -282,18 +285,39 @@ export function useImmich() {
 
     isRefillingUncertainQueue.value = true
     try {
-      const candidates = await fetchReviewCandidates()
-      if (candidates.length === 0) {
-        return
-      }
-
       const seenIds = new Set(uncertainQueue.value.map((item) => item.asset.id))
       const merged = [...uncertainQueue.value]
-      for (const candidate of candidates) {
-        if (seenIds.has(candidate.asset.id)) continue
-        seenIds.add(candidate.asset.id)
-        merged.push(candidate)
+
+      for (let attempt = 0; attempt < UNCERTAIN_QUEUE_REFILL_ATTEMPTS; attempt += 1) {
+        if (merged.length >= UNCERTAIN_QUEUE_TARGET) {
+          break
+        }
+
+        const requestedCount = Math.min(
+          UNCERTAIN_QUEUE_FETCH_LIMIT,
+          Math.max(UNCERTAIN_QUEUE_TARGET, (UNCERTAIN_QUEUE_TARGET - merged.length) + UNCERTAIN_QUEUE_FETCH_PADDING),
+        )
+        const candidates = await fetchReviewCandidates(requestedCount)
+        if (candidates.length === 0) {
+          break
+        }
+
+        let addedCount = 0
+        for (const candidate of candidates) {
+          if (seenIds.has(candidate.asset.id)) continue
+          seenIds.add(candidate.asset.id)
+          merged.push(candidate)
+          addedCount += 1
+          if (merged.length >= UNCERTAIN_QUEUE_TARGET) {
+            break
+          }
+        }
+
+        if (addedCount === 0) {
+          break
+        }
       }
+
       uncertainQueue.value = merged.slice(0, UNCERTAIN_QUEUE_TARGET)
     } catch (e) {
       console.error('Failed to refill uncertain review queue:', e)
