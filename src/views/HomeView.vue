@@ -13,6 +13,8 @@ import AlbumPicker from '@/components/AlbumPicker.vue'
 
 const {
   currentAsset,
+  currentAssetScore,
+  currentAssetSource,
   error,
   loadInitialAsset,
   keepPhoto,
@@ -33,6 +35,13 @@ const showAlbumPicker = ref(false)
 const isLoadingAlbums = ref(false)
 const albumsError = ref<string | null>(null)
 const albums = ref<ImmichAlbum[]>([])
+
+const swipeSourceLabel = {
+  'focused-range': 'Focused queue',
+  'random-fallback': 'Random fallback',
+  chronological: 'Chronological',
+  pending: 'Pending/undo',
+} as const
 
 function queueTrainingDecision(isGood: boolean) {
   const assetId = currentAsset.value?.id ?? null
@@ -202,6 +211,26 @@ onUnmounted(() => {
         </div>
 
         <div class="shrink-0 flex flex-col items-center gap-2">
+          <div
+            v-if="currentAsset"
+            class="flex flex-wrap items-center justify-center gap-2 text-xs"
+          >
+            <span
+              class="rounded-full border px-3 py-1 font-mono"
+              :class="uiStore.isDarkMode ? 'border-gray-700 bg-black/40 text-gray-200' : 'border-gray-300 bg-white text-gray-700'"
+            >
+              {{ currentAssetScore === null ? 'Score: random fallback' : `Score ${currentAssetScore.toFixed(2)}` }}
+            </span>
+            <span
+              class="rounded-full border px-3 py-1"
+              :class="currentAssetSource === 'focused-range'
+                ? 'border-blue-600/40 bg-blue-500/10 text-blue-400'
+                : (uiStore.isDarkMode ? 'border-gray-700 bg-black/40 text-gray-300' : 'border-gray-300 bg-white text-gray-700')"
+            >
+              {{ swipeSourceLabel[currentAssetSource || 'pending'] }}
+            </span>
+          </div>
+
           <!-- Action buttons -->
           <ActionButtons
             v-if="currentAsset"
@@ -235,6 +264,12 @@ onUnmounted(() => {
             :class="uiStore.isDarkMode ? 'text-gray-500' : 'text-gray-500'"
           >
             Focused review range: {{ reviewCandidateSettings.minScore.toFixed(2) }}-{{ reviewCandidateSettings.maxScore.toFixed(2) }}
+          </p>
+          <p
+            class="max-w-xl text-center text-xs"
+            :class="uiStore.isDarkMode ? 'text-gray-500' : 'text-gray-500'"
+          >
+            Random review mode pulls scored photos from this range first. If none are currently available, Swiparr falls back to normal random images.
           </p>
 
           <!-- Instructions (now mobile -> hidden) -->

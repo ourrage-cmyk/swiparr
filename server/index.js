@@ -1145,6 +1145,7 @@ app.get('/api/review-candidates', async (req, res) => {
         const requestedScanBatches = Number.parseInt(String(req.query.scanBatches ?? REVIEW_CANDIDATE_SCAN_BATCHES_DEFAULT), 10);
         const minScore = clampNumber(req.query.minScore, 0, 1, appSettings.reviewCandidateMinScore ?? REVIEW_CANDIDATE_MIN_SCORE_DEFAULT);
         const maxScore = clampNumber(req.query.maxScore, minScore, 1, appSettings.reviewCandidateMaxScore ?? REVIEW_CANDIDATE_MAX_SCORE_DEFAULT);
+        const targetScore = clampNumber(req.query.targetScore, minScore, maxScore, appSettings.autoArchiveConfidenceThreshold ?? AUTO_ARCHIVE_CONFIDENCE_THRESHOLD);
         const targetCount = clampInteger(requestedCount, REVIEW_CANDIDATE_TARGET_MIN, REVIEW_CANDIDATE_TARGET_MAX, REVIEW_CANDIDATE_TARGET_DEFAULT);
         const scanBatchSize = clampInteger(requestedScanBatchSize, REVIEW_CANDIDATE_SCAN_BATCH_MIN, REVIEW_CANDIDATE_SCAN_BATCH_MAX, REVIEW_CANDIDATE_SCAN_BATCH_SIZE);
         const scanBatches = clampInteger(requestedScanBatches, REVIEW_CANDIDATE_SCAN_BATCHES_MIN, REVIEW_CANDIDATE_SCAN_BATCHES_MAX, REVIEW_CANDIDATE_SCAN_BATCHES_DEFAULT);
@@ -1191,7 +1192,15 @@ app.get('/api/review-candidates', async (req, res) => {
 
         const candidates = scoredAssets
             .filter((item) => item.score >= minScore && item.score <= maxScore)
-            .sort((left, right) => Math.abs(left.score - 0.5) - Math.abs(right.score - 0.5))
+            .sort((left, right) => {
+                const leftDistance = Math.abs(left.score - targetScore);
+                const rightDistance = Math.abs(right.score - targetScore);
+                if (leftDistance !== rightDistance) {
+                    return leftDistance - rightDistance;
+                }
+
+                return left.score - right.score;
+            })
             .slice(0, targetCount);
 
         res.json(candidates);

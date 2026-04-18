@@ -50,6 +50,16 @@ export function useImmich() {
     minScore: UNCERTAIN_MIN_SCORE_DEFAULT,
     maxScore: UNCERTAIN_MAX_SCORE_DEFAULT,
   })
+  const currentAssetScore = ref<number | null>(null)
+  const currentAssetSource = ref<'focused-range' | 'random-fallback' | 'chronological' | 'pending' | null>(null)
+  const nextAssetScore = ref<number | null>(null)
+  const nextAssetSource = ref<'focused-range' | 'random-fallback' | 'chronological' | 'pending' | null>(null)
+
+  type LoadedCandidate = {
+    asset: ImmichAsset
+    score: number | null
+    source: 'focused-range' | 'random-fallback' | 'chronological' | 'pending'
+  }
 
   type ReviewAction = {
     asset: ImmichAsset
@@ -79,6 +89,10 @@ export function useImmich() {
     chronologicalPagingMode.value = null
     chronologicalHasMore.value = true
     nextAsset.value = null
+    currentAssetScore.value = null
+    currentAssetSource.value = null
+    nextAssetScore.value = null
+    nextAssetSource.value = null
     pendingAssets.value = []
     actionHistory.value = []
   }
@@ -188,11 +202,27 @@ export function useImmich() {
     }
   }
 
-  function dequeueUncertainAsset(): ImmichAsset | null {
+  function applyCurrentCandidate(candidate: LoadedCandidate | null): void {
+    currentAsset.value = candidate?.asset ?? null
+    currentAssetScore.value = candidate?.score ?? null
+    currentAssetSource.value = candidate?.source ?? null
+  }
+
+  function applyNextCandidate(candidate: LoadedCandidate | null): void {
+    nextAsset.value = candidate?.asset ?? null
+    nextAssetScore.value = candidate?.score ?? null
+    nextAssetSource.value = candidate?.source ?? null
+  }
+
+  function dequeueUncertainAsset(): LoadedCandidate | null {
     while (uncertainQueue.value.length > 0) {
       const candidate = uncertainQueue.value.shift()
       if (candidate && isReviewable(candidate.asset)) {
-        return candidate.asset
+        return {
+          asset: candidate.asset,
+          score: candidate.score,
+          source: 'focused-range',
+        }
       }
     }
 
@@ -273,7 +303,7 @@ export function useImmich() {
   }
 
   // Fetch a random asset
-  async function fetchRandomAsset(): Promise<ImmichAsset | null> {
+  async function fetchRandomAsset(): Promise<LoadedCandidate | null> {
     try {
       if (uncertainQueue.value.length > 0) {
         const queued = dequeueUncertainAsset()
@@ -305,7 +335,13 @@ export function useImmich() {
         }
 
         const candidate = assets.find(isReviewable)
-        if (candidate) return candidate
+        if (candidate) {
+          return {
+            asset: candidate,
+            score: null,
+            source: 'random-fallback',
+          }
+        }
       }
 
       if (uiStore.skipVideos) {
@@ -398,7 +434,7 @@ export function useImmich() {
     return { items, hasMore, nextPage }
   }
 
-  async function fetchNextChronologicalAsset(): Promise<ImmichAsset | null> {
+  async function fetchNextChronologicalAsset(): Promise<LoadedCandidate | null> {
     while (chronologicalQueue.value.length === 0 && chronologicalHasMore.value) {
       await loadChronologicalBatch()
     }
@@ -407,7 +443,14 @@ export function useImmich() {
       return null
     }
 
-    return chronologicalQueue.value.shift() || null
+    const asset = chronologicalQueue.value.shift() || null
+    return asset
+      ? {
+          asset,
+          score: null,
+          source: 'chronological',
+        }
+      : null
   }
 
   async function loadChronologicalBatch(): Promise<void> {
@@ -437,11 +480,15 @@ export function useImmich() {
     }
   }
 
-  async function fetchNextAsset(): Promise<ImmichAsset | null> {
+  async function fetchNextAsset(): Promise<LoadedCandidate | null> {
     while (pendingAssets.value.length > 0) {
       const pending = pendingAssets.value.shift()
       if (pending && !reviewedStore.isReviewed(pending.id)) {
-        return pending
+        return {
+          asset: pending,
+          score: null,
+          source: 'pending',
+        }
       }
     }
     if (preferencesStore.reviewOrder !== 'random') {
@@ -461,7 +508,7 @@ export function useImmich() {
       if (resetFlow) {
         resetReviewFlow()
       }
-      currentAsset.value = await fetchNextAsset()
+      applyCurrentCandidate(await fetchNextAsset())
 
       if (currentAsset.value) {
         preloadNextAsset()
@@ -486,7 +533,7 @@ export function useImmich() {
   // Preload next
   async function preloadNextAsset(): Promise<void> {
     try {
-      nextAsset.value = await fetchNextAsset()
+      applyNextCandidate(await fetchNextAsset())
 
       if (preferencesStore.reviewOrder === 'random') {
         void refillUncertainQueue()
@@ -506,10 +553,18 @@ export function useImmich() {
 
   // Re-useable helper to show an asset and ensure we have a sensible "next" lined up
   function setCurrentAssetWithFallback(asset: ImmichAsset, resumeAsset: ImmichAsset | null): void {
-    currentAsset.value = asset
+    applyCurrentCandidate({
+      asset,
+      score: null,
+      source: 'pending',
+    })
 
     if (resumeAsset && resumeAsset.id !== asset.id) {
-      nextAsset.value = resumeAsset
+      applyNextCandidate({
+        asset: resumeAsset,
+        score: null,
+        source: 'pending',
+      })
     } else if (!nextAsset.value) {
       preloadNextAsset()
     }
@@ -527,7 +582,11 @@ export function useImmich() {
   function moveToNextAsset(): void {
     if (nextAsset.value) {
       currentAsset.value = nextAsset.value
+      currentAssetScore.value = nextAssetScore.value
+      currentAssetSource.value = nextAssetSource.value
       nextAsset.value = null
+      nextAssetScore.value = null
+      nextAssetSource.value = null
       preloadNextAsset()
     } else {
       loadInitialAsset(false)
@@ -809,6 +868,8 @@ export function useImmich() {
   return {
     currentAsset,
     nextAsset,
+    currentAssetScore,
+    currentAssetSource,
     error,
     testConnection,
     loadInitialAsset,
