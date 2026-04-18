@@ -30,8 +30,8 @@ export function useImmich() {
   const UNCERTAIN_QUEUE_REFILL_THRESHOLD = 4
   const UNCERTAIN_SCAN_BATCH_SIZE = 40
   const UNCERTAIN_SCAN_BATCHES = 4
-  const UNCERTAIN_MIN_SCORE = 0.3
-  const UNCERTAIN_MAX_SCORE = 0.6
+  const UNCERTAIN_MIN_SCORE_DEFAULT = 0.2
+  const UNCERTAIN_MAX_SCORE_DEFAULT = 0.5
   const ARCHIVE_VISIBILITY = 'archive'
   const TIMELINE_VISIBILITY = 'timeline'
 
@@ -46,6 +46,10 @@ export function useImmich() {
   const chronologicalPagingMode = ref<'skip' | 'page' | null>(null)
   const chronologicalHasMore = ref(true)
   const isFetchingChronological = ref(false)
+  const reviewCandidateSettings = ref({
+    minScore: UNCERTAIN_MIN_SCORE_DEFAULT,
+    maxScore: UNCERTAIN_MAX_SCORE_DEFAULT,
+  })
 
   type ReviewAction = {
     asset: ImmichAsset
@@ -83,6 +87,10 @@ export function useImmich() {
     () => [authStore.serverUrl, authStore.currentUserName],
     () => {
       albumsCache.value = null
+      reviewCandidateSettings.value = {
+        minScore: UNCERTAIN_MIN_SCORE_DEFAULT,
+        maxScore: UNCERTAIN_MAX_SCORE_DEFAULT,
+      }
       resetReviewFlow()
     }
   )
@@ -191,13 +199,34 @@ export function useImmich() {
     return null
   }
 
+  function clamp01(value: number): number {
+    return Math.min(Math.max(value, 0), 1)
+  }
+
+  async function loadReviewCandidateSettings(): Promise<void> {
+    try {
+      const response = await fetch(`${window.location.origin}/api/settings`)
+      if (!response.ok) return
+      const payload = await response.json() as Record<string, unknown>
+      const minScore = clamp01(Number(payload.reviewCandidateMinScore ?? UNCERTAIN_MIN_SCORE_DEFAULT))
+      const maxScore = clamp01(Number(payload.reviewCandidateMaxScore ?? UNCERTAIN_MAX_SCORE_DEFAULT))
+      reviewCandidateSettings.value = {
+        minScore,
+        maxScore: Math.max(minScore, maxScore),
+      }
+    } catch (e) {
+      console.error('Failed to load review candidate settings:', e)
+    }
+  }
+
   async function fetchReviewCandidates(): Promise<ScoredAsset[]> {
+    await loadReviewCandidateSettings()
     const query = new URLSearchParams({
       count: String(UNCERTAIN_QUEUE_TARGET),
       scanBatchSize: String(UNCERTAIN_SCAN_BATCH_SIZE),
       scanBatches: String(UNCERTAIN_SCAN_BATCHES),
-      minScore: String(UNCERTAIN_MIN_SCORE),
-      maxScore: String(UNCERTAIN_MAX_SCORE),
+      minScore: String(reviewCandidateSettings.value.minScore),
+      maxScore: String(reviewCandidateSettings.value.maxScore),
     })
     const response = await fetch(`${window.location.origin}/api/review-candidates?${query.toString()}`, {
       headers: {
@@ -426,6 +455,8 @@ export function useImmich() {
     try {
       uiStore.setLoading(true, 'Loading photo...')
       error.value = null
+
+      await loadReviewCandidateSettings()
 
       if (resetFlow) {
         resetReviewFlow()
@@ -787,6 +818,7 @@ export function useImmich() {
     archivePhoto,
     undoLastAction,
     canUndo,
+    reviewCandidateSettings,
     getAssetThumbnailUrl,
     getAssetOriginalUrl,
     getAuthHeaders,

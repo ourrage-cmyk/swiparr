@@ -142,8 +142,8 @@ const REVIEW_CANDIDATE_SCAN_BATCH_MAX = 80;
 const REVIEW_CANDIDATE_SCAN_BATCHES_DEFAULT = 4;
 const REVIEW_CANDIDATE_SCAN_BATCHES_MIN = 1;
 const REVIEW_CANDIDATE_SCAN_BATCHES_MAX = 10;
-const REVIEW_CANDIDATE_MIN_SCORE_DEFAULT = 0.3;
-const REVIEW_CANDIDATE_MAX_SCORE_DEFAULT = 0.6;
+const REVIEW_CANDIDATE_MIN_SCORE_DEFAULT = 0.2;
+const REVIEW_CANDIDATE_MAX_SCORE_DEFAULT = 0.5;
 const AUTO_ARCHIVE_MIN_POINTS = MIN_TRAINING_POINTS;
 const MANUAL_SOURCE = 'manual';
 const AUTO_ARCHIVE_CRON_DEFAULT = '0 * * * *';
@@ -878,6 +878,8 @@ function sanitizeSettings(raw = {}) {
     const cronExpression = typeof raw.autoArchiveCronExpression === 'string'
         ? raw.autoArchiveCronExpression.trim()
         : AUTO_ARCHIVE_CRON_DEFAULT;
+    const reviewCandidateMinScore = clampNumber(raw.reviewCandidateMinScore, 0, 1, REVIEW_CANDIDATE_MIN_SCORE_DEFAULT);
+    const reviewCandidateMaxScore = clampNumber(raw.reviewCandidateMaxScore, reviewCandidateMinScore, 1, REVIEW_CANDIDATE_MAX_SCORE_DEFAULT);
 
     return {
         autoArchive: Boolean(raw.autoArchive),
@@ -886,6 +888,8 @@ function sanitizeSettings(raw = {}) {
         autoArchiveScanBatchSize: clampInteger(raw.autoArchiveScanBatchSize, AUTO_ARCHIVE_SCAN_BATCH_MIN, AUTO_ARCHIVE_SCAN_BATCH_MAX, AUTO_ARCHIVE_SCAN_BATCH_SIZE),
         autoArchiveScanBatchesPerRun: clampInteger(raw.autoArchiveScanBatchesPerRun, AUTO_ARCHIVE_SCAN_BATCHES_MIN, AUTO_ARCHIVE_SCAN_BATCHES_MAX, AUTO_ARCHIVE_BATCHES_PER_RUN),
         autoArchiveCronExpression: cron.validate(cronExpression) ? cronExpression : AUTO_ARCHIVE_CRON_DEFAULT,
+        reviewCandidateMinScore,
+        reviewCandidateMaxScore,
         triageBatchSize: clampInteger(raw.triageBatchSize, TRIAGE_BATCH_MIN, TRIAGE_BATCH_MAX, TRIAGE_BATCH_DEFAULT),
     };
 }
@@ -1139,8 +1143,8 @@ app.get('/api/review-candidates', async (req, res) => {
         const requestedCount = Number.parseInt(String(req.query.count ?? REVIEW_CANDIDATE_TARGET_DEFAULT), 10);
         const requestedScanBatchSize = Number.parseInt(String(req.query.scanBatchSize ?? REVIEW_CANDIDATE_SCAN_BATCH_SIZE), 10);
         const requestedScanBatches = Number.parseInt(String(req.query.scanBatches ?? REVIEW_CANDIDATE_SCAN_BATCHES_DEFAULT), 10);
-        const minScore = clampNumber(req.query.minScore, 0, 1, REVIEW_CANDIDATE_MIN_SCORE_DEFAULT);
-        const maxScore = clampNumber(req.query.maxScore, minScore, 1, REVIEW_CANDIDATE_MAX_SCORE_DEFAULT);
+        const minScore = clampNumber(req.query.minScore, 0, 1, appSettings.reviewCandidateMinScore ?? REVIEW_CANDIDATE_MIN_SCORE_DEFAULT);
+        const maxScore = clampNumber(req.query.maxScore, minScore, 1, appSettings.reviewCandidateMaxScore ?? REVIEW_CANDIDATE_MAX_SCORE_DEFAULT);
         const targetCount = clampInteger(requestedCount, REVIEW_CANDIDATE_TARGET_MIN, REVIEW_CANDIDATE_TARGET_MAX, REVIEW_CANDIDATE_TARGET_DEFAULT);
         const scanBatchSize = clampInteger(requestedScanBatchSize, REVIEW_CANDIDATE_SCAN_BATCH_MIN, REVIEW_CANDIDATE_SCAN_BATCH_MAX, REVIEW_CANDIDATE_SCAN_BATCH_SIZE);
         const scanBatches = clampInteger(requestedScanBatches, REVIEW_CANDIDATE_SCAN_BATCHES_MIN, REVIEW_CANDIDATE_SCAN_BATCHES_MAX, REVIEW_CANDIDATE_SCAN_BATCHES_DEFAULT);

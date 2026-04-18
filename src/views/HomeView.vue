@@ -22,6 +22,7 @@ const {
   undoLastAction,
   fetchAlbums,
   canUndo,
+  reviewCandidateSettings,
 } = useImmich()
 const router = useRouter()
 const uiStore = useUiStore()
@@ -229,6 +230,12 @@ onUnmounted(() => {
           >
               Review Settings
           </button>
+          <p
+            class="text-center text-xs"
+            :class="uiStore.isDarkMode ? 'text-gray-500' : 'text-gray-500'"
+          >
+            Focused review range: {{ reviewCandidateSettings.minScore.toFixed(2) }}-{{ reviewCandidateSettings.maxScore.toFixed(2) }}
+          </p>
 
           <!-- Instructions (now mobile -> hidden) -->
           <div class="hidden sm:flex text-center text-sm py-2 items-center flex-col gap-y-2"

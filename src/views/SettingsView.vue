@@ -22,6 +22,8 @@ const settings = ref({
   autoArchiveScanBatchSize: 40,
   autoArchiveScanBatchesPerRun: 3,
   autoArchiveCronExpression: '0 * * * *',
+  reviewCandidateMinScore: 0.2,
+  reviewCandidateMaxScore: 0.5,
   triageBatchSize: 60,
 })
 
@@ -40,10 +42,21 @@ const selectedCronPreset = computed(() => {
 
 const estimatedScanCount = computed(() => settings.value.autoArchiveScanBatchSize * settings.value.autoArchiveScanBatchesPerRun)
 const thresholdLabel = computed(() => settings.value.autoArchiveConfidenceThreshold.toFixed(2))
+const reviewRangeMinLabel = computed(() => settings.value.reviewCandidateMinScore.toFixed(2))
+const reviewRangeMaxLabel = computed(() => settings.value.reviewCandidateMaxScore.toFixed(2))
 
 function applyCronPreset(value: string) {
   if (value !== 'custom') {
     settings.value.autoArchiveCronExpression = value
+  }
+}
+
+function normalizeReviewRange(changed: 'min' | 'max') {
+  if (changed === 'min' && settings.value.reviewCandidateMinScore > settings.value.reviewCandidateMaxScore) {
+    settings.value.reviewCandidateMaxScore = settings.value.reviewCandidateMinScore
+  }
+  if (changed === 'max' && settings.value.reviewCandidateMaxScore < settings.value.reviewCandidateMinScore) {
+    settings.value.reviewCandidateMinScore = settings.value.reviewCandidateMaxScore
   }
 }
 
@@ -150,6 +163,45 @@ onMounted(() => {
             />
             <p class="mt-2 text-xs" :class="uiStore.isDarkMode ? 'text-gray-500' : 'text-gray-500'">
               Controls how many images the triage grid requests and scores per load. Safe range: 12-250.
+            </p>
+          </section>
+
+          <section class="rounded-2xl border p-5" :class="uiStore.isDarkMode ? 'border-gray-800 bg-gray-950/70' : 'border-gray-200 bg-gray-50'">
+            <h2 class="text-lg font-semibold">Primary Swipe Review Range</h2>
+            <p class="mt-2 text-sm" :class="uiStore.isDarkMode ? 'text-gray-400' : 'text-gray-600'">
+              In random review mode, Swiparr first tries to serve photos inside this score window before falling back to fully random picks. This is the best place to focus on borderline images near your archive threshold.
+            </p>
+
+            <label class="mt-5 block text-sm font-medium">Minimum score for swipe review</label>
+            <div class="mt-2 flex items-center gap-4">
+              <input
+                v-model.number="settings.reviewCandidateMinScore"
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                class="w-full"
+                @input="normalizeReviewRange('min')"
+              />
+              <span class="min-w-12 text-right font-mono text-sm">{{ reviewRangeMinLabel }}</span>
+            </div>
+
+            <label class="mt-5 block text-sm font-medium">Maximum score for swipe review</label>
+            <div class="mt-2 flex items-center gap-4">
+              <input
+                v-model.number="settings.reviewCandidateMaxScore"
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                class="w-full"
+                @input="normalizeReviewRange('max')"
+              />
+              <span class="min-w-12 text-right font-mono text-sm">{{ reviewRangeMaxLabel }}</span>
+            </div>
+
+            <p class="mt-3 text-xs" :class="uiStore.isDarkMode ? 'text-gray-500' : 'text-gray-500'">
+              Example: if your archive threshold is {{ thresholdLabel }}, a swipe review range of {{ reviewRangeMinLabel }}-{{ reviewRangeMaxLabel }} will concentrate manual swiping on the edge cases that teach the model most.
             </p>
           </section>
 
